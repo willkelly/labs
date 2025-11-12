@@ -1,0 +1,1078 @@
+#+TITLE: Understanding the Fact/Datum/Is/Of System: A Shopping List Walkthrough
+#+AUTHOR: Research Investigation
+#+DATE: 2025-11-12
+#+OPTIONS: toc:2 num:t
+
+* Executive Summary
+
+The =packages/memory= system implements a **content-addressed, transactional, and causally-ordered** memory store using SQLite. It stores:
+- **Facts** (assertions/retractions) about entities over time
+- **Datums** (deduplicated JSON values) referenced by facts
+- **Current state** (latest fact for each entity)
+
+The system uses **compare-and-swap (CAS)** semantics to prevent conflicting concurrent updates, with all changes tracked through a causality chain using merkle references.
+
+* Table of Contents :TOC:
+- [[#executive-summary][Executive Summary]]
+- [[#core-concepts][Core Concepts]]
+  - [[#the-data-model][The Data Model]]
+  - [[#database-schema][Database Schema]]
+  - [[#merkle-references][Merkle References]]
+- [[#shopping-list-walkthrough][Shopping List Walkthrough]]
+  - [[#step-1-creating-the-shopping-list][Step 1: Creating the Shopping List]]
+  - [[#step-2-adding-milk][Step 2: Adding Milk]]
+  - [[#step-3-adding-bread][Step 3: Adding Bread]]
+  - [[#step-4-adding-eggs][Step 4: Adding Eggs]]
+  - [[#step-5-removing-milk-retraction][Step 5: Removing Milk (Retraction)]]
+- [[#concurrent-updates-and-cas][Concurrent Updates and CAS]]
+  - [[#scenario-two-users-add-items-simultaneously][Scenario: Two Users Add Items Simultaneously]]
+  - [[#cas-mechanics][CAS Mechanics]]
+- [[#sql-operations-deep-dive][SQL Operations Deep Dive]]
+  - [[#assertion-flow][Assertion Flow]]
+  - [[#retraction-flow][Retraction Flow]]
+  - [[#query-flow][Query Flow]]
+- [[#patterns-and-recipes-integration][Patterns and Recipes Integration]]
+- [[#key-insights][Key Insights]]
+
+* Core Concepts
+
+** The Data Model
+
+The memory system uses a four-field fact model:
+
+- =the= :: Type of fact (MIME type, typically "application/json")
+- =of= :: Entity identifier (URI, often content-addressed with "of:" prefix)
+- =is= :: The JSON value (or undefined for retractions)
+- =cause= :: Reference to previous fact (establishes causality chain)
+
+*** Types of Facts
+
+1. **Unclaimed** - Entity doesn't exist yet
+   #+begin_src typescript
+   { the: "application/json", of: "of:babc...", is: undefined, cause: undefined }
+   #+end_src
+
+2. **Assertion** - Entity has a value
+   #+begin_src typescript
+   { 
+     the: "application/json", 
+     of: "of:babc...", 
+     is: { "items": ["milk"] },
+     cause: { "/": "baed..." }  // merkle reference
+   }
+   #+end_src
+
+3. **Retraction** - Entity is deleted
+   #+begin_src typescript
+   { 
+     the: "application/json", 
+     of: "of:babc...", 
+     is: undefined,
+     cause: { "/": "bafw..." }  // reference to assertion being retracted
+   }
+   #+end_src
+
+** Database Schema
+
+The system uses three tables:
+
+#+begin_example
+┌─────────────────────┐
+│  datum              │  Stores deduplicated JSON values
+├─────────────────────┤
+│ this    (PK)        │  Merkle reference (content hash)
+│ source  (JSON)      │  The actual JSON data
+└─────────────────────┘
+         ▲
+         │ foreign key (is → this)
+         │
+┌─────────────────────┐
+│  fact               │  Complete history of all changes
+├─────────────────────┤
+│ this    (PK)        │  Merkle reference of {the, of, is, cause}
+│ the                 │  Type (MIME type)
+│ of                  │  Entity identifier
+│ is      (FK)        │  Reference to datum OR "undefined"
+│ cause               │  Reference to previous fact
+│ since   (int)       │  Lamport clock timestamp
+└─────────────────────┘
+         ▲
+         │ foreign key (fact → this)
+         │
+┌─────────────────────┐
+│  memory             │  Current state (latest fact per entity)
+├─────────────────────┤
+│ the     (PK)        │  Type
+│ of      (PK)        │  Entity identifier
+│ fact    (FK)        │  Reference to current fact
+└─────────────────────┘
+#+end_example
+
+** Merkle References
+
+All causality and content is tracked using merkle references (content-addressed hashes):
+- Format: base32-encoded multihash with "b" prefix (e.g., "baedreigv6dnlwjzyyzk2z2ld2...")
+- In JSON: ={ "/": "baedreigv6dnlwjzyyzk2z2ld2..." }=
+- Computed from the canonical JSON representation
+- Ensures immutability and verifiability
+
+* Shopping List Walkthrough
+
+Let's walk through creating a shopping list and modifying it step by step.
+
+** Setup
+
+We're working in a memory space:
+- Space: =did:key:z6Mkk89bC3JrVqKie71YEcc5M1SMVxuCgNx6zLZ8SYJsxALi= (Alice's space)
+- Shopping list entity: =of:babc4jyxwz5n6nxklzghq7pbqd4sdi53qvzey3hhfanv2ggb3r3q= (derived from seed data)
+- Type: =application/json=
+
+** Step 1: Creating the Shopping List
+
+*** Initial State (Before Creation)
+
+The entity is **unclaimed** - it doesn't exist in the database yet.
+
+**** Tables are empty:
+
+**datum table:**
+#+begin_example
+┌──────────┬────────┐
+│ this     │ source │
+├──────────┼────────┤
+│undefined │ NULL   │  ← Special record for retractions
+└──────────┴────────┘
+#+end_example
+
+**fact table:**
+#+begin_example
+(empty)
+#+end_example
+
+**memory table:**
+#+begin_example
+(empty)
+#+end_example
+
+*** Creating the List
+
+User creates a shopping list with initial empty array:
+
+#+begin_src typescript
+const shoppingList = Fact.assert({
+  the: "application/json",
+  of: "of:babc4jyxwz5n6nxklzghq7pbqd4sdi53qvzey3hhfanv2ggb3r3q",
+  is: { items: [] },
+  // cause is automatically computed: refer(unclaimed({ the, of }))
+});
+#+end_src
+
+*** What Happens Internally
+
+1. **Compute cause for unclaimed state:**
+   #+begin_src typescript
+   cause = refer({ 
+     the: "application/json", 
+     of: "of:babc4jyxwz5n6nxklzghq7pbqd4sdi53qvzey3hhfanv2ggb3r3q" 
+   })
+   // Result: "baedreigv6dnlwjzyyzk2z2ld2kapmu6hvqp46f3axmgdowebqgbts5jksi"
+   #+end_src
+
+2. **Compute fact reference:**
+   #+begin_src typescript
+   factRef = refer({
+     the: "application/json",
+     of: "of:babc4jyxwz5n6nxklzghq7pbqd4sdi53qvzey3hhfanv2ggb3r3q",
+     is: { items: [] },
+     cause: { "/": "baedreigv6dnlwjzyyzk2z2ld2kapmu6hvqp46f3axmgdowebqgbts5jksi" }
+   })
+   // Result: "baedreia7xsqxp3h5qiqjkn4h3oq5pdffp6sjkxvfsuqjnqm2wzk7qy"
+   #+end_src
+
+3. **Compute datum reference:**
+   #+begin_src typescript
+   datumRef = refer({ items: [] })
+   // Result: "baedreib2wzap5t5g3gtkmzgjq7ehvxnqkfi3lwgo4qckyqe3kgfgza"
+   #+end_src
+
+*** SQL Operations
+
+**** Insert datum:
+#+begin_src sql
+INSERT OR IGNORE INTO datum (this, source) 
+VALUES (
+  'baedreib2wzap5t5g3gtkmzgjq7ehvxnqkfi3lwgo4qckyqe3kgfgza', 
+  '{"items":[]}'
+);
+#+end_src
+
+**** Insert fact:
+#+begin_src sql
+INSERT OR IGNORE INTO fact (this, the, of, 'is', cause, since) 
+VALUES (
+  'baedreia7xsqxp3h5qiqjkn4h3oq5pdffp6sjkxvfsuqjnqm2wzk7qy',
+  'application/json',
+  'of:babc4jyxwz5n6nxklzghq7pbqd4sdi53qvzey3hhfanv2ggb3r3q',
+  'baedreib2wzap5t5g3gtkmzgjq7ehvxnqkfi3lwgo4qckyqe3kgfgza',
+  'baedreigv6dnlwjzyyzk2z2ld2kapmu6hvqp46f3axmgdowebqgbts5jksi',
+  0  -- Lamport clock: first event
+);
+#+end_src
+
+**** Insert memory record (since cause = unclaimed):
+#+begin_src sql
+INSERT OR IGNORE INTO memory (the, of, fact) 
+VALUES (
+  'application/json',
+  'of:babc4jyxwz5n6nxklzghq7pbqd4sdi53qvzey3hhfanv2ggb3r3q',
+  'baedreia7xsqxp3h5qiqjkn4h3oq5pdffp6sjkxvfsuqjnqm2wzk7qy'
+);
+#+end_src
+
+*** State After Step 1
+
+**datum table:**
+#+begin_example
+┌────────────────────────────────────────────────┬──────────────┐
+│ this                                           │ source       │
+├────────────────────────────────────────────────┼──────────────┤
+│ undefined                                      │ NULL         │
+│ baedreib2wzap5t5g3gtkmzgjq7ehvxnqkfi3lwgo... │ {"items":[]} │
+└────────────────────────────────────────────────┴──────────────┘
+#+end_example
+
+**fact table:**
+#+begin_example
+┌──────────────────────────────┬──────────────────┬──────────────┬──────────────────┬────────────────────────┬───────┐
+│ this                         │ the              │ of           │ is               │ cause                  │ since │
+├──────────────────────────────┼──────────────────┼──────────────┼──────────────────┼────────────────────────┼───────┤
+│ baedreia7xsqxp3h5qiqjkn4... │ application/json │ of:babc4j... │ baedreib2wzap... │ baedreigv6dnlwjzyyzkl│   0   │
+│   (fact for empty list)      │                  │ (list)       │ (empty array)    │ (unclaimed)            │       │
+└──────────────────────────────┴──────────────────┴──────────────┴──────────────────┴────────────────────────┴───────┘
+#+end_example
+
+**memory table:**
+#+begin_example
+┌──────────────────┬──────────────┬──────────────────────────────┐
+│ the              │ of           │ fact                         │
+├──────────────────┼──────────────┼──────────────────────────────┤
+│ application/json │ of:babc4j... │ baedreia7xsqxp3h5qiqjkn4... │
+│                  │ (list)       │ (current fact)               │
+└──────────────────┴──────────────┴──────────────────────────────┘
+#+end_example
+
+** Step 2: Adding Milk
+
+*** Creating the Update
+
+#+begin_src typescript
+const v1 = Fact.assert({
+  the: "application/json",
+  of: "of:babc4jyxwz5n6nxklzghq7pbqd4sdi53qvzey3hhfanv2ggb3r3q",
+  is: { items: ["milk"] },
+  cause: { "/": "baedreia7xsqxp3h5qiqjkn4h3oq5pdffp6sjkxvfsuqjnqm2wzk7qy" }
+  // ↑ References the previous fact (empty list)
+});
+#+end_src
+
+*** What Happens Internally
+
+1. **Compute new datum reference:**
+   #+begin_src typescript
+   datumRef = refer({ items: ["milk"] })
+   // Result: "baedreifwmxqh3qv5jzknhjkmz7qp3xg6p7ytdlkjryx5j5nqk6p2va"
+   #+end_src
+
+2. **Compute new fact reference:**
+   #+begin_src typescript
+   factRef = refer({
+     the: "application/json",
+     of: "of:babc4jyxwz5n6nxklzghq7pbqd4sdi53qvzey3hhfanv2ggb3r3q",
+     is: { items: ["milk"] },
+     cause: { "/": "baedreia7xsqxp3h5qiqjkn4h3oq5pdffp6sjkxvfsuqjnqm2wzk7qy" }
+   })
+   // Result: "baedreih6yjnxp2qm3kk4hlvqivgn5rjw7nqshzzxpy7qgk3m5akxni"
+   #+end_src
+
+*** SQL Operations
+
+**** Insert new datum:
+#+begin_src sql
+INSERT OR IGNORE INTO datum (this, source) 
+VALUES (
+  'baedreifwmxqh3qv5jzknhjkmz7qp3xg6p7ytdlkjryx5j5nqk6p2va', 
+  '{"items":["milk"]}'
+);
+#+end_src
+
+**** Insert new fact:
+#+begin_src sql
+INSERT OR IGNORE INTO fact (this, the, of, 'is', cause, since) 
+VALUES (
+  'baedreih6yjnxp2qm3kk4hlvqivgn5rjw7nqshzzxpy7qgk3m5akxni',
+  'application/json',
+  'of:babc4jyxwz5n6nxklzghq7pbqd4sdi53qvzey3hhfanv2ggb3r3q',
+  'baedreifwmxqh3qv5jzknhjkmz7qp3xg6p7ytdlkjryx5j5nqk6p2va',
+  'baedreia7xsqxp3h5qiqjkn4h3oq5pdffp6sjkxvfsuqjnqm2wzk7qy',  -- previous fact
+  1  -- Lamport clock increments
+);
+#+end_src
+
+**** Update memory (CAS operation):
+#+begin_src sql
+UPDATE memory 
+SET fact = 'baedreih6yjnxp2qm3kk4hlvqivgn5rjw7nqshzzxpy7qgk3m5akxni'
+WHERE the = 'application/json'
+  AND of = 'of:babc4jyxwz5n6nxklzghq7pbqd4sdi53qvzey3hhfanv2ggb3r3q'
+  AND fact = 'baedreia7xsqxp3h5qiqjkn4h3oq5pdffp6sjkxvfsuqjnqm2wzk7qy';
+  --         ↑ ONLY updates if current fact matches expected cause!
+#+end_src
+
+This UPDATE is the **compare-and-swap (CAS)** operation. If the current =fact= in memory doesn't match the =cause= we provided, the update fails (returns 0 rows updated), and a ConflictError is raised.
+
+*** State After Step 2
+
+**datum table:**
+#+begin_example
+┌────────────────────────────────────────────────┬───────────────────┐
+│ this                                           │ source            │
+├────────────────────────────────────────────────┼───────────────────┤
+│ undefined                                      │ NULL              │
+│ baedreib2wzap5t5g3gtkmzgjq7ehvxnqkfi3lwgo... │ {"items":[]}      │
+│ baedreifwmxqh3qv5jzknhjkmz7qp3xg6p7ytdlkj... │ {"items":["milk"]}│
+└────────────────────────────────────────────────┴───────────────────┘
+#+end_example
+
+**fact table:** (now has causality chain)
+#+begin_example
+┌──────────────────────────────┬──────────────────┬──────────────┬──────────────────┬────────────────────────┬───────┐
+│ this                         │ the              │ of           │ is               │ cause                  │ since │
+├──────────────────────────────┼──────────────────┼──────────────┼──────────────────┼────────────────────────┼───────┤
+│ baedreia7xsqxp3h5qiqjkn4... │ application/json │ of:babc4j... │ baedreib2wzap... │ baedreigv6dnlwjzyy...  │   0   │
+│   (empty list)               │                  │              │ (empty array)    │ (unclaimed)            │       │
+├──────────────────────────────┼──────────────────┼──────────────┼──────────────────┼────────────────────────┼───────┤
+│ baedreih6yjnxp2qm3kk4hlv... │ application/json │ of:babc4j... │ baedreifwmxqh... │ baedreia7xsqxp3h5q...  │   1   │
+│   (with milk)                │                  │              │ (["milk"])       │ (prev fact: empty)     │       │
+└──────────────────────────────┴──────────────────┴──────────────┴──────────────────┴────────────────────────┴───────┘
+                                                                                       ▲
+                                                                                       │
+                                                                        Causality chain: 1 ──cause──> 0
+#+end_example
+
+**memory table:** (updated to point to new fact)
+#+begin_example
+┌──────────────────┬──────────────┬──────────────────────────────┐
+│ the              │ of           │ fact                         │
+├──────────────────┼──────────────┼──────────────────────────────┤
+│ application/json │ of:babc4j... │ baedreih6yjnxp2qm3kk4hlv... │ ← Updated!
+│                  │              │ (now points to "milk" fact)  │
+└──────────────────┴──────────────┴──────────────────────────────┘
+#+end_example
+
+** Step 3: Adding Bread
+
+#+begin_src typescript
+const v2 = Fact.assert({
+  the: "application/json",
+  of: "of:babc4jyxwz5n6nxklzghq7pbqd4sdi53qvzey3hhfanv2ggb3r3q",
+  is: { items: ["milk", "bread"] },
+  cause: { "/": "baedreih6yjnxp2qm3kk4hlvqivgn5rjw7nqshzzxpy7qgk3m5akxni" }
+  // ↑ References the "milk" fact
+});
+#+end_src
+
+*** State After Step 3
+
+**datum table:**
+#+begin_example
+┌────────────────────────────────────────────────┬────────────────────────────┐
+│ this                                           │ source                     │
+├────────────────────────────────────────────────┼────────────────────────────┤
+│ undefined                                      │ NULL                       │
+│ baedreib2wzap5t5g3gtkmzgjq7ehvxnqkfi3lwgo... │ {"items":[]}               │
+│ baedreifwmxqh3qv5jzknhjkmz7qp3xg6p7ytdlkj... │ {"items":["milk"]}         │
+│ baedreij4x7qnk5zm3kqshqjpzx3wg7yltxkfnx2f... │ {"items":["milk","bread"]} │
+└────────────────────────────────────────────────┴────────────────────────────┘
+#+end_example
+
+**fact table:** (causality chain grows)
+#+begin_example
+┌──────────────────────────────┬──────────────────┬──────────────┬──────────────────┬────────────────────────┬───────┐
+│ this                         │ the              │ of           │ is               │ cause                  │ since │
+├──────────────────────────────┼──────────────────┼──────────────┼──────────────────┼────────────────────────┼───────┤
+│ baedreia7xsqxp3h5qiqjkn4... │ application/json │ of:babc4j... │ baedreib2wzap... │ baedreigv6dnlwjzyy...  │   0   │
+│   (empty)                    │                  │              │ ([])             │ (unclaimed)            │       │
+├──────────────────────────────┼──────────────────┼──────────────┼──────────────────┼────────────────────────┼───────┤
+│ baedreih6yjnxp2qm3kk4hlv... │ application/json │ of:babc4j... │ baedreifwmxqh... │ baedreia7xsqxp3h5q...  │   1   │
+│   (milk)                     │                  │              │ (["milk"])       │ (empty)                │       │
+├──────────────────────────────┼──────────────────┼──────────────┼──────────────────┼────────────────────────┼───────┤
+│ baedreij4x7qnk5zm3kqshqj... │ application/json │ of:babc4j... │ baedreij4x7qn... │ baedreih6yjnxp2qm3...  │   2   │
+│   (milk+bread)               │                  │              │ (["milk","br"..])│ (milk)                 │       │
+└──────────────────────────────┴──────────────────┴──────────────┴──────────────────┴────────────────────────┴───────┘
+
+Causality chain: 2 ──cause──> 1 ──cause──> 0 ──cause──> (unclaimed)
+#+end_example
+
+** Step 4: Adding Eggs
+
+#+begin_src typescript
+const v3 = Fact.assert({
+  the: "application/json",
+  of: "of:babc4jyxwz5n6nxklzghq7pbqd4sdi53qvzey3hhfanv2ggb3r3q",
+  is: { items: ["milk", "bread", "eggs"] },
+  cause: { "/": "baedreij4x7qnk5zm3kqshqjpzx3wg7yltxkfnx2f..." }
+  // ↑ References the "milk+bread" fact
+});
+#+end_src
+
+*** Complete State After All Additions
+
+**Causality Chain Visualization:**
+#+begin_example
+  Time ──────────────────────────────────────────────>
+  
+  Unclaimed                Empty List           + Milk              + Bread            + Eggs
+  (implicit)               (since: 0)          (since: 1)         (since: 2)         (since: 3)
+      │                        │                   │                  │                  │
+      │ cause                  │ cause             │ cause            │ cause            │
+      └────────────────────────┴───────────────────┴──────────────────┴──────────────────┘
+                                                                                          ▲
+                                                                                          │
+                                                                                 memory points here
+#+end_example
+
+**Final datum table:**
+#+begin_example
+┌────────────────────────────────────────────────┬─────────────────────────────────────┐
+│ this                                           │ source                              │
+├────────────────────────────────────────────────┼─────────────────────────────────────┤
+│ undefined                                      │ NULL                                │
+│ baedreib2wzap5t5g3gtkmzgjq7ehvxnqkfi3lwgo... │ {"items":[]}                        │
+│ baedreifwmxqh3qv5jzknhjkmz7qp3xg6p7ytdlkj... │ {"items":["milk"]}                  │
+│ baedreij4x7qnk5zm3kqshqjpzx3wg7yltxkfnx2f... │ {"items":["milk","bread"]}          │
+│ baedreik8y9rmn7ao5lrtirlqa4yxh8zmuylgoy3g... │ {"items":["milk","bread","eggs"]}   │
+└────────────────────────────────────────────────┴─────────────────────────────────────┘
+#+end_example
+
+** Step 5: Removing Milk (Retraction)
+
+Now let's say we bought milk and want to remove it from the list.
+
+*** Creating the Retraction
+
+#+begin_src typescript
+// Get the current fact first
+const currentFact = {
+  the: "application/json",
+  of: "of:babc4jyxwz5n6nxklzghq7pbqd4sdi53qvzey3hhfanv2ggb3r3q",
+  is: { items: ["milk", "bread", "eggs"] },
+  cause: { "/": "baedreij4x7qnk5zm3kqshqjpzx3wg7yltxkfnx2f..." }
+};
+
+// Create retraction
+const retraction = Fact.retract(currentFact);
+// Result:
+// {
+//   the: "application/json",
+//   of: "of:babc4jyxwz5n6nxklzghq7pbqd4sdi53qvzey3hhfanv2ggb3r3q",
+//   is: undefined,  // ← No value!
+//   cause: { "/": "baedreik8y9rmn7ao5lrtirlqa4yxh8zmuylgoy3g..." }
+// }
+#+end_src
+
+*** What is a Retraction?
+
+A **retraction** is a special fact that indicates an entity no longer exists or has been deleted. Key properties:
+- =is= field is =undefined=
+- =cause= points to the fact being retracted
+- Still stored in the =fact= table (maintains history)
+- The datum reference is the special ="undefined"= key
+
+*** SQL Operations for Retraction
+
+**** Compute retraction fact reference:
+#+begin_src typescript
+retractionRef = refer({
+  the: "application/json",
+  of: "of:babc4jyxwz5n6nxklzghq7pbqd4sdi53qvzey3hhfanv2ggb3r3q",
+  cause: { "/": "baedreik8y9rmn7ao5lrtirlqa4yxh8zmuylgoy3g..." }
+  // is: undefined (not included in hash computation)
+})
+// Result: "baedreimxz4n7p8q5krzqisl4b5yzi9nvymhpozzypz8qhl4n6blora"
+#+end_src
+
+**** Insert retraction fact:
+#+begin_src sql
+INSERT OR IGNORE INTO fact (this, the, of, 'is', cause, since) 
+VALUES (
+  'baedreimxz4n7p8q5krzqisl4b5yzi9nvymhpozzypz8qhl4n6blora',
+  'application/json',
+  'of:babc4jyxwz5n6nxklzghq7pbqd4sdi53qvzey3hhfanv2ggb3r3q',
+  'undefined',  -- ← Special datum key for retractions!
+  'baedreik8y9rmn7ao5lrtirlqa4yxh8zmuylgoy3g...',  -- fact being retracted
+  4  -- Lamport clock
+);
+#+end_src
+
+**** Update memory (CAS):
+#+begin_src sql
+UPDATE memory 
+SET fact = 'baedreimxz4n7p8q5krzqisl4b5yzi9nvymhpozzypz8qhl4n6blora'
+WHERE the = 'application/json'
+  AND of = 'of:babc4jyxwz5n6nxklzghq7pbqd4sdi53qvzey3hhfanv2ggb3r3q'
+  AND fact = 'baedreik8y9rmn7ao5lrtirlqa4yxh8zmuylgoy3g...';
+#+end_src
+
+*** State After Retraction
+
+**fact table:** (retraction added to history)
+#+begin_example
+┌──────────────────────────────┬──────────────────┬──────────────┬──────────────────┬────────────────────────┬───────┐
+│ this                         │ the              │ of           │ is               │ cause                  │ since │
+├──────────────────────────────┼──────────────────┼──────────────┼──────────────────┼────────────────────────┼───────┤
+│ baedreia7xsqxp3h5qiqjkn4... │ application/json │ of:babc4j... │ baedreib2wzap... │ baedreigv6dnlwjzyy...  │   0   │
+│ baedreih6yjnxp2qm3kk4hlv... │ application/json │ of:babc4j... │ baedreifwmxqh... │ baedreia7xsqxp3h5q...  │   1   │
+│ baedreij4x7qnk5zm3kqshqj... │ application/json │ of:babc4j... │ baedreij4x7qn... │ baedreih6yjnxp2qm3...  │   2   │
+│ baedreik8y9rmn7ao5lrtirlq... │ application/json │ of:babc4j... │ baedreik8y9rm... │ baedreij4x7qnk5zm3...  │   3   │
+├──────────────────────────────┼──────────────────┼──────────────┼──────────────────┼────────────────────────┼───────┤
+│ baedreimxz4n7p8q5krzqisl... │ application/json │ of:babc4j... │ undefined        │ baedreik8y9rmn7ao5...  │   4   │
+│   (RETRACTION)               │                  │              │ ← No value!      │ (retracting prev fact) │       │
+└──────────────────────────────┴──────────────────┴──────────────┴──────────────────┴────────────────────────┴───────┘
+#+end_example
+
+**memory table:**
+#+begin_example
+┌──────────────────┬──────────────┬──────────────────────────────┐
+│ the              │ of           │ fact                         │
+├──────────────────┼──────────────┼──────────────────────────────┤
+│ application/json │ of:babc4j... │ baedreimxz4n7p8q5krzqisl... │ ← Points to retraction!
+│                  │              │ (retraction fact)            │
+└──────────────────┴──────────────┴──────────────────────────────┘
+#+end_example
+
+**Causality Chain with Retraction:**
+#+begin_example
+  Unclaimed ──> Empty ──> Milk ──> Milk+Bread ──> Milk+Bread+Eggs ──> RETRACTED
+  (implicit)    (0)       (1)      (2)             (3)                 (4)
+                                                                         ▲
+                                                                         │
+                                                              memory points here
+#+end_example
+
+*** Querying After Retraction
+
+When you query with =is: {}= filter (meaning "only return entities with values"):
+#+begin_src sql
+SELECT * FROM state 
+WHERE the = 'application/json' 
+  AND of = 'of:babc4j...' 
+  AND 'is' IS NOT NULL;  -- Filters out retractions!
+#+end_src
+
+**Result:** Empty! The shopping list is gone from the current state view.
+
+But the **history is preserved** in the =fact= table. You can always reconstruct what happened.
+
+* Concurrent Updates and CAS
+
+** Scenario: Two Users Add Items Simultaneously
+
+Let's say Alice and Bob both have the shopping list open and try to add items at the same time.
+
+*** Initial State
+
+Both users see:
+#+begin_example
+{ items: ["milk", "bread"] }
+Fact reference: "baedreij4x7qnk5zm3kqshqjpzx3wg7yltxkfnx2f..."
+#+end_example
+
+*** Alice's Operation (arrives first)
+
+Alice adds "eggs":
+#+begin_src typescript
+const aliceFact = Fact.assert({
+  the: "application/json",
+  of: "of:babc4j...",
+  is: { items: ["milk", "bread", "eggs"] },
+  cause: { "/": "baedreij4x7qnk5zm3kqshqjpzx3wg7yltxkfnx2f..." }
+  // ↑ Expected current state
+});
+#+end_src
+
+SQL CAS operation **succeeds** because =fact= in memory matches =cause=:
+#+begin_src sql
+UPDATE memory 
+SET fact = 'baedreik8y9rmn7ao5lrtirlqa4yxh8zmuylgoy3g...'  -- Alice's new fact
+WHERE the = 'application/json'
+  AND of = 'of:babc4j...'
+  AND fact = 'baedreij4x7qnk5zm3kqshqjpzx3wg7yltxkfnx2f...';  -- matches!
+-- Returns: 1 row updated ✓
+#+end_src
+
+*** Bob's Operation (arrives second)
+
+Bob adds "cheese":
+#+begin_src typescript
+const bobFact = Fact.assert({
+  the: "application/json",
+  of: "of:babc4j...",
+  is: { items: ["milk", "bread", "cheese"] },
+  cause: { "/": "baedreij4x7qnk5zm3kqshqjpzx3wg7yltxkfnx2f..." }
+  // ↑ Expected current state (now outdated!)
+});
+#+end_src
+
+SQL CAS operation **fails** because =fact= in memory no longer matches =cause=:
+#+begin_src sql
+UPDATE memory 
+SET fact = 'baedreio9a8snp3r6lszrjsm5c6zja0owzniqpa4a...'  -- Bob's new fact
+WHERE the = 'application/json'
+  AND of = 'of:babc4j...'
+  AND fact = 'baedreij4x7qnk5zm3kqshqjpzx3wg7yltxkfnx2f...';  -- DOESN'T match!
+-- Returns: 0 rows updated ✗
+#+end_src
+
+*** Conflict Detected
+
+The system detects the conflict and throws a =ConflictError=:
+#+begin_example
+ConflictError: The application/json of of:babc4j... in did:key:... 
+was expected to be baedreij4x7qnk5zm3kqshqjpzx3wg7yltxkfnx2f..., 
+but it is baedreik8y9rmn7ao5lrtirlqa4yxh8zmuylgoy3g...
+
+Conflict details:
+  space: "did:key:z6Mkk89bC3JrVqKie71YEcc5M1SMVxuCgNx6zLZ8SYJsxALi"
+  the: "application/json"
+  of: "of:babc4j..."
+  expected: { "/": "baedreij4x7qnk5zm3kqshqjpzx3wg7yltxkfnx2f..." }  // Bob's cause
+  actual: {
+    the: "application/json",
+    of: "of:babc4j...",
+    is: { items: ["milk", "bread", "eggs"] },  // Alice's change!
+    cause: { "/": "baedreij4x7qnk5zm3kqshqjpzx3wg7yltxkfnx2f..." },
+    since: 3
+  }
+  existsInHistory: false  // Bob's cause isn't outdated, just wrong timing
+#+end_example
+
+*** Bob's Client Must Retry
+
+Bob's client receives the error and must:
+1. **Fetch the latest state** (with Alice's "eggs" addition)
+2. **Merge or reapply** his changes (add "cheese" to the new list)
+3. **Retry** with the new cause:
+   #+begin_src typescript
+   const bobRetry = Fact.assert({
+     the: "application/json",
+     of: "of:babc4j...",
+     is: { items: ["milk", "bread", "eggs", "cheese"] },  // Combined!
+     cause: { "/": "baedreik8y9rmn7ao5lrtirlqa4yxh8zmuylgoy3g..." }  // Alice's fact
+   });
+   #+end_src
+
+Now the CAS succeeds!
+
+** CAS Mechanics
+
+*** The SWAP SQL Query
+
+The core CAS operation:
+#+begin_src sql
+UPDATE memory 
+SET fact = :new_fact
+WHERE the = :the
+  AND of = :of
+  AND fact = :expected_cause;  -- ← This is the "compare" in CAS
+#+end_src
+
+Key properties:
+- **Atomic**: The compare and swap happen in one operation
+- **Safe**: No lost updates possible
+- **Conflict detection**: Returns 0 if compare fails
+- **Transactional**: Wrapped in SQLite transaction
+
+*** What Gets Checked
+
+#+begin_example
+┌─────────────────────────────────────────────────────────────┐
+│  CAS Check                                                  │
+├─────────────────────────────────────────────────────────────┤
+│  Current state (in memory table):                          │
+│    fact = "baedreik8y9rmn7ao5..."  (Alice's fact)          │
+│                                                             │
+│  Bob's expected state (his cause):                          │
+│    cause = "baedreij4x7qnk5zm3..."  (outdated)             │
+│                                                             │
+│  Comparison:                                                │
+│    "baedreik8y9rmn7ao5..." ≠ "baedreij4x7qnk5zm3..."       │
+│                                                             │
+│  Result: CONFLICT! ✗                                        │
+└─────────────────────────────────────────────────────────────┘
+#+end_example
+
+*** Why CAS Matters
+
+1. **No Lost Updates**: Two concurrent writes can't both succeed
+2. **Linearizable History**: All changes form a clear causal chain
+3. **Optimistic Concurrency**: No locks needed, clients retry on conflict
+4. **Auditability**: Full history preserved in =fact= table
+
+* SQL Operations Deep Dive
+
+** Assertion Flow
+
+When asserting a new fact, the system executes these SQL operations in sequence:
+
+*** 1. Import Datum (Content Deduplication)
+#+begin_src sql
+INSERT OR IGNORE INTO datum (this, source) 
+VALUES (
+  'baedrei...',  -- merkle reference of JSON value
+  '{"items":["milk"]}'  -- JSON string
+);
+#+end_src
+
+The =OR IGNORE= means:
+- If this exact JSON value was already stored → skip (deduplication)
+- Otherwise → insert new row
+
+This enables **content-addressed storage**: identical values share one row.
+
+*** 2. Import Fact (Historical Record)
+#+begin_src sql
+INSERT OR IGNORE INTO fact (this, the, of, 'is', cause, since) 
+VALUES (
+  'baedfact...',  -- merkle reference of entire fact
+  'application/json',  -- type
+  'of:babc4j...',  -- entity
+  'baedrei...',  -- reference to datum (foreign key)
+  'baedprev...',  -- reference to previous fact (causality)
+  2  -- Lamport timestamp
+);
+#+end_src
+
+Creates permanent historical record. Never deleted.
+
+*** 3. Memory Insert or Update
+
+**** If creating new entity (cause = unclaimed):
+#+begin_src sql
+INSERT OR IGNORE INTO memory (the, of, fact) 
+VALUES ('application/json', 'of:babc4j...', 'baedfact...');
+#+end_src
+
+**** If updating existing entity:
+#+begin_src sql
+UPDATE memory 
+SET fact = 'baedfact...'
+WHERE the = 'application/json'
+  AND of = 'of:babc4j...'
+  AND fact = 'baedprev...';  -- CAS condition
+#+end_src
+
+*** 4. Conflict Detection
+
+If UPDATE returns 0 rows:
+#+begin_src typescript
+const updated = session.store.run(SWAP, { fact, cause, the, of });
+
+if (updated === 0) {
+  // Get actual current state
+  const revision = recall(session, { the, of });
+  
+  // Check if it matches what we tried to set
+  if (refer(revision).toString() !== fact) {
+    // CONFLICT! Throw error with details
+    throw Error.conflict(transaction, {
+      space,
+      the,
+      of,
+      expected: cause,
+      actual: revision,
+      existsInHistory: false
+    });
+  }
+  // Otherwise: duplicate assertion, no-op
+}
+#+end_src
+
+** Retraction Flow
+
+Very similar to assertion, except:
+1. =is= field points to ="undefined"= datum
+2. No new datum is created (reuses the special "undefined" row)
+3. Fact is still recorded in =fact= table
+4. Memory table updated to point to retraction fact
+
+** Query Flow
+
+*** Simple Query (Latest State)
+
+To get current value of shopping list:
+#+begin_src sql
+SELECT state.the, state.of, state.'is', state.cause, state.since
+FROM state
+WHERE state.the = 'application/json'
+  AND state.of = 'of:babc4j...'
+  AND state.'is' IS NOT NULL;  -- exclude retractions
+#+end_src
+
+The =state= view joins all three tables:
+#+begin_src sql
+CREATE VIEW state AS
+SELECT
+  memory.the AS the,
+  memory.of AS of,
+  datum.source AS 'is',  -- Resolves JSON value
+  fact.cause AS cause,
+  memory.fact AS fact,
+  datum.this AS proof,
+  fact.since AS since
+FROM memory
+JOIN fact ON memory.fact = fact.this
+JOIN datum ON datum.this = fact.'is';
+#+end_src
+
+*** Historical Query (Full Causality Chain)
+
+To reconstruct all changes to shopping list:
+#+begin_src sql
+WITH RECURSIVE cause_of(c, f) AS (
+  -- Start with facts for this entity
+  SELECT cause, this FROM fact 
+  WHERE fact.of = 'of:babc4j...' 
+    AND fact.the = 'application/json'
+  
+  UNION
+  
+  -- Recursively follow cause chain
+  SELECT cause, this FROM fact, cause_of 
+  WHERE fact.this = cause_of.c
+)
+SELECT c as cause, f as fact FROM cause_of;
+#+end_src
+
+Returns the entire history in reverse chronological order.
+
+* Patterns and Recipes Integration
+
+** How Recipes Use This System
+
+Recipes (CT applications) interact with the memory system through high-level APIs:
+
+*** Creating a Shopping List Recipe
+
+#+begin_src javascript
+// In a recipe handler
+export const handler = {
+  create: async ({ cell }) => {
+    // cell.the = "application/json"
+    // cell.of = computed from cell data
+    // cell.is = { items: [] }
+    
+    await cell.transact();  // Calls Fact.assert internally
+  },
+  
+  addItem: async ({ cell, event }) => {
+    const items = cell.get('items') || [];
+    items.push(event.detail.item);
+    
+    cell.set('items', items);
+    await cell.transact();  // CAS automatically handles conflicts
+  },
+  
+  removeItem: async ({ cell, event }) => {
+    const items = cell.get('items') || [];
+    const index = items.indexOf(event.detail.item);
+    if (index > -1) items.splice(index, 1);
+    
+    cell.set('items', items);
+    await cell.transact();  // Updates with new cause
+  }
+};
+#+end_src
+
+*** What Happens Under the Hood
+
+1. **cell.get()** → Queries current state from memory
+2. **cell.set()** → Stages changes locally
+3. **cell.transact()** → 
+   - Creates Fact.assert with current cause
+   - Submits to space
+   - Handles ConflictError by refetching and retrying
+   - Emits events to update UI
+
+*** Conflict Resolution
+
+If two users modify simultaneously:
+#+begin_src javascript
+try {
+  await cell.transact();
+} catch (error) {
+  if (error.name === 'ConflictError') {
+    // Automatic retry:
+    // 1. Fetch latest state
+    // 2. Merge changes (recipe-specific logic)
+    // 3. Retry with new cause
+    await cell.refresh();
+    await cell.transact();
+  }
+}
+#+end_src
+
+** Cell Lifts and Causality
+
+**Lifts** (computed values) automatically track dependencies:
+#+begin_src javascript
+export const lifts = {
+  itemCount: ({ cell }) => {
+    const items = cell.get('items') || [];
+    return items.length;
+  },
+  
+  // This lift depends on another cell
+  combinedList: ({ cell, derive }) => {
+    const myItems = cell.get('items') || [];
+    const otherList = derive('other-list-cell-id');
+    const otherItems = otherList.get('items') || [];
+    return [...myItems, ...otherItems];
+  }
+};
+#+end_src
+
+When underlying facts change (due to CAS updates), lifts automatically recompute.
+
+** Subscription and Real-time Updates
+
+#+begin_src javascript
+// Subscribe to changes
+const subscription = await space.subscribe({
+  watch: {
+    [space]: {
+      the: "application/json",
+      of: "of:babc4j..."
+    }
+  }
+});
+
+// Receive updates when anyone modifies the list
+subscription.onmessage = (event) => {
+  const { the, of, is, cause, since } = event.data;
+  // Update UI with new state
+  updateShoppingListDisplay(is.items);
+};
+#+end_src
+
+* Key Insights
+
+** 1. Immutability Through Content Addressing
+
+Every fact has a merkle reference computed from its content. This makes:
+- Facts **immutable** (changing content changes the reference)
+- History **tamper-evident** (can't modify past facts)
+- Deduplication **automatic** (same content = same reference)
+
+** 2. Causality Enables CAS
+
+The =cause= field creates a **directed acyclic graph (DAG)** of changes:
+#+begin_example
+   Unclaimed
+      │
+      ├──> Assertion 1
+      │       │
+      │       ├──> Assertion 2
+      │       │       │
+      │       │       └──> Assertion 3
+      │       │               │
+      │       │               └──> Retraction
+      │       │
+      │       └──> Concurrent Assertion (CONFLICT!)
+      │
+      └──> Another Entity's History...
+#+end_example
+
+CAS prevents concurrent branches by requiring clients to specify expected cause.
+
+** 3. Three Tables, Three Purposes
+
+- **datum**: Content storage (deduplicated)
+- **fact**: Historical log (append-only)
+- **memory**: Current state (mutable via CAS)
+
+This separation enables:
+- Efficient queries (query memory, not entire history)
+- Complete history (fact table has everything)
+- Storage efficiency (datums deduplicated)
+
+** 4. Retractions Are Facts Too
+
+Deleting an entity creates a **retraction fact** rather than removing data:
+- History preserved
+- Can track "who deleted what when"
+- Can reconstruct state at any point in time
+- Retractions can be undone (assert after retract)
+
+** 5. Lamport Clocks Order Events
+
+The =since= field uses a **Lamport clock**:
+- Increments with each change to the space
+- Provides total ordering of facts
+- Enables time-travel queries ("show me state at since=42")
+- Allows incremental synchronization
+
+** 6. Space Isolation
+
+Each space (identified by DID) has its own SQLite database:
+- Spaces are independent
+- Same entity ID in different spaces = different entities
+- Enables access control boundaries
+- Simplifies replication logic
+
+** 7. Compare-and-Swap is Optimistic
+
+CAS doesn't use locks:
+- **Optimistic**: Assume no conflicts, handle them when they occur
+- **Scalable**: No lock contention
+- **Client-side retry**: Conflicts pushed to edge
+- **Automatic**: Recipes/patterns handle retries transparently
+
+** 8. Merkle Trees Enable Verification
+
+Because everything is content-addressed:
+- Can verify integrity of any fact
+- Can prove a fact exists in history
+- Can detect tampering
+- Can implement efficient sync protocols (like git)
+
+** 9. Foreign Keys Maintain Consistency
+
+SQLite foreign keys ensure:
+- Every fact references a valid datum
+- Every memory row references a valid fact
+- Cascade semantics if needed
+- Referential integrity maintained
+
+** 10. The "undefined" Datum is Special
+
+#+begin_src sql
+INSERT OR IGNORE INTO datum (this, source) VALUES ('undefined', NULL);
+#+end_src
+
+This special row:
+- Represents "no value" (since NULL isn't valid JSON)
+- Used by all retractions
+- Allows joining fact→datum for retractions
+- Maintains foreign key constraints
+
+---
+
+#+BEGIN_CENTER
+*End of Report*
+
+For questions or clarifications, see:
+- =packages/memory/README.md= - Overview and HTTP API
+- =packages/memory/space.ts= - SQL schema and operations
+- =packages/memory/test/space-test.ts= - Test examples
+- =packages/memory/interface.ts= - TypeScript types
+#+END_CENTER

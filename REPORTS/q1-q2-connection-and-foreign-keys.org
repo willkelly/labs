@@ -1,0 +1,723 @@
+#+TITLE: SQLite Read/Write Connection Management and Foreign Key Investigation
+#+AUTHOR: Research Specialist
+#+DATE: 2025-11-12
+#+OPTIONS: toc:2 num:t
+
+* Executive Summary
+
+This report investigates two critical aspects of SQLite usage in =packages/memory=:
+
+1. *Q1 - Connection Management*: The =perform= method in =memory.ts= claims to work around "some bug in deno sqlite bindings" but this appears to be a *misconception about SQLite's concurrency model* rather than an actual bug in the Deno SQLite library.
+
+2. *Q2 - Foreign Key Constraints*: Foreign keys are declared in the schema but are *NOT being enforced* because SQLite disables them by default and the code does not execute =PRAGMA foreign_keys = ON;=.
+
+*Key Findings:*
+- SQLite allows *multiple concurrent reads* but only *one write transaction at a time*, even in WAL mode
+- Running queries and transactions concurrently on the *same connection* is problematic regardless of the library used
+- Foreign key enforcement must be explicitly enabled per-connection and is currently disabled
+- No tests validate foreign key behavior
+
+* Q1: SQLite Read/Write Connection Management
+
+** The Issue
+
+File: =packages/memory/memory.ts:67-76=
+
+#+begin_src typescript
+/**
+ * Runs task one at a time, this works around some bug in deno sqlite bindings
+ * which seems to cause problems if query and transaction happen concurrently.
+ */
+async perform<Out>(task: () => Promise<Out>): Promise<Out> {
+  return await traceAsync("memory.perform", async (_span) => {
+    const result = this.ready.finally().then(task);
+    this.ready = result.finally();
+    await this.ready;
+    return await result;
+  });
+}
+#+end_src
+
+** Git History Analysis
+
+The =perform= method was introduced in commit =e52bf31= on Oct 22, 2025:
+
+#+begin_example
+commit e52bf31175e10c8d9b721a7d9252442e4a2481aa
+Author: Jordan Santell <jsanteld@users.noreply.github.com>
+Date:   Wed Oct 22 11:18:25 2025 -0700
+
+    chore: Update gmail recipe to latest and greatest (#1936)
+#+end_example
+
+This was a massive commit (~60,000 lines) that added the entire =packages/memory= package to the codebase. The comment about "bug in deno sqlite bindings" was present in the initial import, suggesting the code (and misconception) came from an external source.
+
+*No git history exists* showing the actual problem that led to adding this workaround, as the package was imported wholesale.
+
+** SQLite Concurrency Model
+
+*** Core SQLite Behavior
+
+SQLite's concurrency model has fundamental limitations:
+
+1. *Multiple Readers, Single Writer*: SQLite allows multiple simultaneous read transactions but only ONE write transaction at a time
+2. *Connection-Level Locking*: Locks are managed at the database file level, not the connection level
+3. *Transaction Serialization*: Write transactions are inherently serialized, even in WAL mode
+
+*** WAL Mode Benefits and Limitations
+
+*WAL (Write-Ahead Logging) Mode:*
+- Allows concurrent readers with one writer
+- Readers don't block writers, writers don't block readers
+- BUT: Still only ONE write transaction at a time
+
+From SQLite documentation:
+#+begin_quote
+"WAL mode provides more concurrency as readers do not block writers and a writer does not block readers. Reading and writing can proceed concurrently. However, SQLite allows only one write transaction at a time."
+#+end_quote
+
+*** The Real Problem: Same-Connection Concurrency
+
+The issue is NOT a bug in =@db/sqlite=, but rather a fundamental limitation:
+
+*You cannot run a query and a write transaction concurrently on the SAME database connection.*
+
+This is true for ALL SQLite libraries because:
+1. SQLite is single-threaded per connection
+2. Transactions acquire locks that affect the entire connection
+3. Mixing reads and writes on the same connection during an active transaction causes lock contention
+
+** Code Analysis: Connection Management
+
+File: =packages/memory/space.ts:332-335, 367-370=
+
+#+begin_src typescript
+// In connect():
+database = await new Database(address ?? ":memory:", {
+  create: false,
+});
+
+// In open():
+database = await new Database(address ?? ":memory:", {
+  create: true,
+});
+#+end_src
+
+File: =packages/memory/migrate.ts:80-82=
+
+#+begin_src typescript
+const db = new Database(path, {
+  create: false,
+  unsafeConcurrency: true,  // ⚠️ Note this flag!
+});
+#+end_src
+
+*Key Observations:*
+
+1. Each =Space= instance has ONE =Database= connection (=store= field)
+2. The =Memory= class maintains a map of =Space= instances (one per subject/did)
+3. The =perform= method serializes ALL operations on a Memory instance
+4. The migration code uses =unsafeConcurrency: true= flag
+
+** Analysis: Is This Actually a Bug?
+
+*No, this is NOT a bug in =@db/sqlite=.*
+
+The behavior described is *correct SQLite behavior*. The issues arise from:
+
+1. *Design Choice*: Using a single connection per Space
+2. *SQLite Architecture*: One writer at a time per database
+3. *Transaction Management*: Active transactions lock the connection
+
+** The =@db/sqlite= Library
+
+File: =packages/memory/deno.json:42=
+
+#+begin_src json
+"imports": {
+  "@db/sqlite": "jsr:@db/sqlite@^0.12.0",
+  "@opentelemetry/api": "npm:@opentelemetry/api@^1.9.0"
+}
+#+end_src
+
+The =@db/sqlite= library:
+- Version: 0.12.0 from JSR (JavaScript Registry)
+- Uses Deno's FFI to interface with native SQLite
+- Provides =Database.transaction()= method for atomic operations
+- Does NOT support WAL mode due to Deno filesystem API limitations
+
+From web research:
+#+begin_quote
+"Due to limitations in Deno's file system APIs, SQLite can't acquire file locks or memory map files (e.g. this module does not support WAL mode)"
+#+end_quote
+
+** How Transactions Work in =@db/sqlite=
+
+File: =packages/memory/space.ts:865=
+
+#+begin_src typescript
+return execute(session.store.transaction(commit), session, transaction);
+#+end_src
+
+The =Database.transaction()= method:
+1. Wraps a function in a SQLite transaction
+2. Executes =BEGIN TRANSACTION= before the function
+3. Executes =COMMIT= if successful, =ROLLBACK= if error
+4. Serializes write operations automatically
+
+** Would a Read Pool Help?
+
+*Yes, a separate read connection pool would help* if:
+
+1. The application has high concurrent read load
+2. Writes are less frequent than reads
+3. Read queries take significant time
+
+*Benefits:*
+- Multiple read connections can query simultaneously
+- Write connection remains dedicated to transactions
+- Better throughput for read-heavy workloads
+
+*Implementation Considerations:*
+- SQLite in =@db/sqlite= doesn't support WAL mode (a limitation)
+- Without WAL, readers block writers and vice versa
+- Connection pool only helps if queries are on different connections
+
+** Current Architecture Analysis
+
+#+begin_example
+Memory (Session)
+  ├── ready: Promise<unknown>  ← Serialization queue
+  ├── perform() ← Serializes ALL operations
+  └── spaces: Map<DID, SpaceSession>
+       └── SpaceSession
+            └── store: Database ← Single connection per space
+                 ├── transaction() ← Write operations
+                 └── prepare() / run() ← Read operations
+#+end_example
+
+*The =perform= method creates a sequential queue:*
+
+#+begin_src typescript
+async perform<Out>(task: () => Promise<Out>): Promise<Out> {
+  // Queue task after current 'ready' promise
+  const result = this.ready.finally().then(task);
+  // Update 'ready' to wait for this task
+  this.ready = result.finally();
+  // Wait and return
+  await this.ready;
+  return await result;
+}
+#+end_src
+
+This ensures operations run sequentially:
+- =transact()= → waits for previous operation
+- =query()= → waits for previous operation
+- =close()= → waits for previous operation
+
+** Testing Observations
+
+File: =packages/memory/test/space-test.ts=
+
+- Tests run sequentially (no concurrent test cases found)
+- Test named "concurrent update fails" (line 406) is about *optimistic concurrency control* (CAS), not connection concurrency
+- No tests validate concurrent reads and writes on same connection
+- All tests use in-memory databases (=memory:= protocol)
+
+** Recommendations for Q1
+
+*** 1. Update the Comment (Critical)
+
+The comment is misleading and should be corrected:
+
+#+begin_src typescript
+/**
+ * Runs tasks one at a time to ensure proper SQLite transaction semantics.
+ *
+ * SQLite allows only one write transaction at a time per database file.
+ * This method serializes all database operations (queries and transactions)
+ * to prevent lock contention on the single connection per Space.
+ *
+ * Note: This is not a workaround for a library bug, but rather an
+ * architectural choice given SQLite's single-writer limitation.
+ */
+async perform<Out>(task: () => Promise<Out>): Promise<Out> {
+  // ... existing implementation
+}
+#+end_src
+
+*** 2. Consider Read Connection Pool (Optional)
+
+*IF* the application has high concurrent read load:
+
+#+begin_src typescript
+class Space {
+  private writeConnection: Database;
+  private readPool: Database[];
+
+  query(source: Query) {
+    // Use read pool for SELECT queries
+    const conn = this.getReadConnection();
+    return executeQuery(conn, source);
+  }
+
+  transact(transaction: Transaction) {
+    // Use dedicated write connection
+    return this.writeConnection.transaction(commit)(this, transaction);
+  }
+}
+#+end_src
+
+*Caveats:*
+- =@db/sqlite= doesn't support WAL mode
+- Without WAL, benefits are limited
+- Read-your-writes consistency requires careful handling
+- Increases connection overhead
+
+*** 3. Document SQLite Concurrency Model
+
+Add documentation explaining:
+- One writer at a time per database
+- Why operations are serialized
+- When read pools might help
+- Trade-offs of current architecture
+
+*** 4. Monitor for Actual Bottlenecks
+
+Before optimizing:
+- Profile actual query/transaction times
+- Measure concurrent load patterns
+- Identify if serialization is actually a bottleneck
+- Consider if the problem is worth solving
+
+* Q2: Foreign Key Pragma Investigation
+
+** The Issue
+
+File: =packages/memory/space.ts:62-135=
+
+The =PREPARE= SQL declares foreign key constraints:
+
+#+begin_src sql
+CREATE TABLE IF NOT EXISTS fact (
+  -- ... columns ...
+  FOREIGN KEY('is') REFERENCES datum(this)
+);
+
+CREATE TABLE IF NOT EXISTS memory (
+  -- ... columns ...
+  FOREIGN KEY(fact) REFERENCES fact(this),
+  PRIMARY KEY (the, of)
+);
+#+end_src
+
+*Question:* Are these constraints actually being enforced?
+
+** SQLite Foreign Key Behavior
+
+*** Default: DISABLED
+
+From SQLite documentation:
+#+begin_quote
+"Foreign key constraints are disabled by default (for backwards compatibility), so must be enabled separately for each database connection."
+#+end_quote
+
+*** Enabling Foreign Keys
+
+Foreign keys must be enabled with:
+
+#+begin_src sql
+PRAGMA foreign_keys = ON;
+#+end_src
+
+*Important:*
+- Must be executed for EACH connection
+- Cannot be set persistently in the database file
+- Not inherited by new connections
+- Future SQLite versions might enable by default (but not yet)
+
+** Code Analysis: No PRAGMA Found
+
+Search results for PRAGMA in =packages/memory=:
+
+#+begin_example
+$ grep -i PRAGMA packages/memory/**/*.ts
+(no results)
+
+$ grep -i PRAGMA packages/memory/**/*.sql
+(no results)
+#+end_example
+
+*Conclusion:* No code enables foreign key constraints.
+
+** Where Foreign Keys Are Declared
+
+*** 1. Initial Schema
+
+File: =packages/memory/space.ts:87-88, 101=
+
+#+begin_src sql
+CREATE TABLE IF NOT EXISTS fact (
+  -- ...
+  FOREIGN KEY('is') REFERENCES datum(this)
+);
+
+CREATE TABLE IF NOT EXISTS memory (
+  -- ...
+  FOREIGN KEY(fact) REFERENCES fact(this),
+  -- ...
+);
+#+end_src
+
+*** 2. Migration Files
+
+File: =packages/memory/migrations/001-drop-maybe_datum.sql:29, 36=
+
+#+begin_src sql
+CREATE TABLE fact (
+  -- ...
+  FOREIGN KEY('is') REFERENCES datum(this)
+);
+
+CREATE TABLE memory (
+  -- ...
+  FOREIGN KEY(fact) REFERENCES fact(this),
+  -- ...
+);
+#+end_src
+
+File: =packages/memory/migrations/002-remove_coalesce.sql:18, 39=
+
+Similar foreign key declarations.
+
+*** 3. Migration Code Commentary
+
+File: =packages/memory/migrations/001-drop-maybe_datum.sql:53-55=
+
+#+begin_src sql
+-- Not sure why but without this complicated query we run into
+-- foreign key constraint while this seems to avoid it yet copy same
+-- amount of rows.
+#+end_src
+
+*This comment is revealing:* The migration author encountered foreign key violations and worked around them with a complex query, but didn't realize foreign keys are likely disabled!
+
+** Connection Creation Analysis
+
+File: =packages/memory/space.ts:332-335=
+
+#+begin_src typescript
+database = await new Database(address ?? ":memory:", {
+  create: false,
+});
+database.exec(PREPARE);
+#+end_src
+
+File: =packages/memory/space.ts:367-370=
+
+#+begin_src typescript
+database = await new Database(address ?? ":memory:", {
+  create: true,
+});
+database.exec(PREPARE);
+#+end_src
+
+*No PRAGMA statements are executed after connection creation.*
+
+** Testing for Foreign Key Enforcement
+
+Search results:
+
+#+begin_example
+$ grep -i "foreign" packages/memory/test/**/*.ts
+(no results)
+#+end_example
+
+*No tests validate foreign key behavior.*
+
+** What Should Happen vs. What Does Happen
+
+*** If Foreign Keys Were Enabled:
+
+These operations would fail:
+
+1. *Insert fact with invalid =is= reference:*
+#+begin_src sql
+INSERT INTO fact (this, the, of, 'is', cause, since)
+VALUES ('fact1', 'app/json', 'doc1', 'invalid_datum_ref', NULL, 0);
+-- Would fail: FOREIGN KEY constraint failed
+#+end_src
+
+2. *Delete datum still referenced by fact:*
+#+begin_src sql
+DELETE FROM datum WHERE this = 'some_datum';
+-- Would fail if fact.is still references it
+#+end_src
+
+3. *Insert memory with invalid fact reference:*
+#+begin_src sql
+INSERT INTO memory (the, of, fact)
+VALUES ('app/json', 'doc1', 'invalid_fact_ref');
+-- Would fail: FOREIGN KEY constraint failed
+#+end_src
+
+*** Current Behavior (Foreign Keys Disabled):
+
+All the above operations *succeed silently*, potentially leaving:
+- Dangling references
+- Orphaned records
+- Data integrity violations
+
+** Impact Assessment
+
+*** Severity: Medium to High
+
+*Current Risk:*
+- No referential integrity enforcement at database level
+- Application logic must ensure consistency
+- Bugs could create invalid references
+- Data corruption could go undetected
+
+*Why Not Higher Severity:*
+- Application code appears carefully designed
+- Foreign keys in schema serve as documentation
+- Views use INNER JOINs which would filter invalid references
+- No evidence of actual data corruption in tests
+
+*** Affected Operations
+
+File: =packages/memory/space.ts:646-652=
+
+#+begin_src typescript
+const importDatum = <Space extends MemorySpace>(
+  session: Session<Space>,
+  datum: JSONValue | undefined,
+): string => {
+  if (datum === undefined) {
+    return "undefined";
+  } else {
+    const is = refer(datum).toString();
+    session.store.run(IMPORT_DATUM, {
+      this: is,
+      source: JSON.stringify(datum),
+    });
+    return is;
+  }
+};
+#+end_src
+
+Without foreign key enforcement:
+- Could insert fact with non-existent datum reference
+- Database wouldn't prevent orphaned references
+- Application logic must be correct
+
+** Recommendations for Q2
+
+*** 1. Enable Foreign Keys (Critical)
+
+Add PRAGMA immediately after connection creation:
+
+File: =packages/memory/space.ts=
+
+#+begin_src typescript
+export const connect = async <Subject extends MemorySpace>({
+  url,
+}: Options): AsyncResult<Space<Subject>, ToJSON<ConnectionError>> => {
+  return await traceAsync("space.connect", async (span) => {
+    // ... existing code ...
+    database = await new Database(address ?? ":memory:", {
+      create: false,
+    });
+
+    // ✅ ADD THIS:
+    database.exec("PRAGMA foreign_keys = ON;");
+
+    database.exec(PREPARE);
+    // ... rest of code ...
+  });
+};
+
+export const open = async <Subject extends MemorySpace>({
+  url,
+}: Options): AsyncResult<Space<Subject>, ConnectionError> => {
+  return await traceAsync("space.open", async (span) => {
+    // ... existing code ...
+    database = await new Database(address ?? ":memory:", {
+      create: true,
+    });
+
+    // ✅ ADD THIS:
+    database.exec("PRAGMA foreign_keys = ON;");
+
+    database.exec(PREPARE);
+    // ... rest of code ...
+  });
+};
+#+end_src
+
+*** 2. Update Migration Code
+
+File: =packages/memory/migrate.ts:85=
+
+#+begin_src typescript
+export const main = (database: string) => {
+  const path = Deno.realPathSync(database);
+  console.log(`💾 Loading ${path}`);
+  const db = new Database(path, {
+    create: false,
+    unsafeConcurrency: true,
+  });
+
+  // ✅ ADD THIS:
+  db.exec("PRAGMA foreign_keys = ON;");
+
+  return db.transaction(migrate)(db);
+};
+#+end_src
+
+*** 3. Add Test Coverage
+
+Create test file: =packages/memory/test/foreign-key-test.ts=
+
+#+begin_src typescript
+import { assert, assertRejects } from "@std/assert";
+import { Database } from "@db/sqlite";
+import * as Space from "../space.ts";
+
+Deno.test("foreign keys are enforced", async () => {
+  const session = await Space.open({
+    url: new URL("memory:test"),
+  });
+
+  assert(session.ok);
+  const db = session.ok.store;
+
+  // Test 1: Cannot insert fact with invalid datum reference
+  await assertRejects(
+    async () => {
+      db.run(
+        `INSERT INTO fact (this, the, of, 'is', cause, since)
+         VALUES ('test', 'app/json', 'doc', 'invalid_ref', NULL, 0)`,
+      );
+    },
+    Error,
+    "FOREIGN KEY constraint failed",
+  );
+
+  // Test 2: Cannot delete referenced datum
+  db.run(
+    `INSERT INTO datum (this, source) VALUES ('ref1', '{"test": true}')`,
+  );
+  db.run(
+    `INSERT INTO fact (this, the, of, 'is', cause, since)
+     VALUES ('fact1', 'app/json', 'doc', 'ref1', NULL, 0)`,
+  );
+
+  await assertRejects(
+    async () => {
+      db.run(`DELETE FROM datum WHERE this = 'ref1'`);
+    },
+    Error,
+    "FOREIGN KEY constraint failed",
+  );
+
+  session.ok.close();
+});
+
+Deno.test("verify foreign keys are ON", async () => {
+  const session = await Space.open({
+    url: new URL("memory:test2"),
+  });
+
+  assert(session.ok);
+  const result = session.ok.store.prepare(
+    "PRAGMA foreign_keys",
+  ).get();
+
+  assert(result);
+  assert(result.foreign_keys === 1, "Foreign keys should be enabled");
+
+  session.ok.close();
+});
+#+end_src
+
+*** 4. Document Foreign Key Requirements
+
+Add to =packages/memory/README.md= or similar:
+
+#+begin_example
+## Database Constraints
+
+Foreign key constraints are declared in the schema and MUST be enabled:
+
+- `fact.is` → `datum.this`
+- `memory.fact` → `fact.this`
+
+These are enabled automatically when opening a database connection via
+the `Space.open()` or `Space.connect()` functions.
+
+If you create Database connections manually, you MUST execute:
+```sql
+PRAGMA foreign_keys = ON;
+```
+#+end_example
+
+*** 5. Review Migration Comment
+
+File: =packages/memory/migrations/001-drop-maybe_datum.sql:53-55=
+
+Update the comment to explain the actual issue:
+
+#+begin_src sql
+-- Complex query to ensure proper foreign key relationships.
+-- The LEFT JOIN filters out any orphaned references that might
+-- exist in the archive tables before migration.
+#+end_src
+
+** Additional Findings: =unsafeConcurrency= Flag
+
+File: =packages/memory/migrate.ts:82=
+
+#+begin_src typescript
+const db = new Database(path, {
+  create: false,
+  unsafeConcurrency: true,  // ⚠️ What does this do?
+});
+#+end_src
+
+This flag is specific to =@db/sqlite= but not well documented. It likely:
+- Disables some safety checks
+- Allows concurrent access (with caveats)
+- Used only in migration script, not in main code
+
+*Recommendation:* Research this flag and document why it's needed for migrations.
+
+* Summary of Recommendations
+
+** Critical (Must Fix)
+
+1. ✅ *Enable foreign keys* - Add =PRAGMA foreign_keys = ON;= after every connection
+2. ✅ *Update perform comment* - Replace "bug" with accurate explanation
+3. ✅ *Add foreign key tests* - Validate constraints are enforced
+
+** Important (Should Fix)
+
+4. ✅ *Document SQLite concurrency model* - Explain single-writer limitation
+5. ✅ *Document foreign key requirements* - Make constraints explicit
+6. ✅ *Review migration comments* - Fix misleading comment about foreign keys
+
+** Optional (Consider)
+
+7. ⚪ *Add read connection pool* - Only if profiling shows bottleneck
+8. ⚪ *Research unsafeConcurrency* - Understand and document the flag
+9. ⚪ *Profile actual performance* - Measure before optimizing
+
+* Conclusion
+
+Both issues stem from misconceptions about SQLite behavior:
+
+1. *Q1*: The "bug in deno sqlite bindings" is not a bug at all, but correct SQLite behavior. The serialization is a reasonable workaround for the architectural choice of using a single connection per Space, given SQLite's single-writer limitation.
+
+2. *Q2*: Foreign keys are declared but not enforced because SQLite requires explicit enabling via PRAGMA. This is a real data integrity risk that should be fixed immediately.
+
+The good news: Both issues are well understood and have straightforward fixes. The code is otherwise well-structured and the use of transactions shows good understanding of database semantics.

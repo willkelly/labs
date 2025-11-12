@@ -1,0 +1,1785 @@
+#+TITLE: Testing Strategy and Additional Concerns for packages/memory
+#+AUTHOR: Research Report
+#+DATE: 2025-11-12
+#+OPTIONS: toc:2 num:t
+
+* Executive Summary
+
+This report provides a comprehensive testing strategy and identifies additional concerns for the packages/memory SQLite-based persistence layer. Key findings:
+
+1. *Current Testing*: Tests exist but lack migration-specific and backward compatibility tests
+2. *Database Configuration*: No PRAGMA statements found - foreign keys may not be enforced by default
+3. *Migration System*: Basic migration framework exists but lacks robust testing
+4. *Concurrency*: Sequential execution pattern implemented but no formal concurrency tests
+5. *Critical Gaps*: Missing foreign key enforcement, no WAL mode, limited error recovery testing
+
+* Q8: Testing Strategy for Safe Changes
+
+** 1. Backward Compatibility Testing
+
+*** Current State Analysis
+
+**** Existing Test Structure
+- Location: ~/packages/memory/test/~
+- Test files:
+  - ~memory-test.ts~ - Basic memory operations
+  - ~space-test.ts~ - Space-level operations (1060+ lines, extensive)
+  - ~access-test.ts~ - Authorization tests
+  - ~consumer-test.ts~ - Consumer API tests (1420+ lines)
+  - ~stress-debug.ts~ - Stress testing (2000 events)
+
+**** Test Patterns Observed
+#+BEGIN_SRC typescript
+// Pattern 1: In-memory testing
+const memory = new URL(`memory://`);
+
+// Pattern 2: Temporary file testing
+const url = new URL(`./${space.did()}.sqlite`, await createTemporaryDirectory());
+
+// Pattern 3: Database initialization
+const session = await Space.open({ url });
+#+END_SRC
+
+**** What's Missing
+- [ ] No migration-specific tests
+- [ ] No backward compatibility tests for schema changes
+- [ ] No tests with pre-existing databases from older versions
+- [ ] No fixture databases at different migration levels
+
+*** Recommended Backward Compatibility Testing Strategy
+
+**** A. Test Fixture Creation
+#+BEGIN_SRC typescript
+// Create test databases at each migration level
+// Location: packages/memory/test/fixtures/
+
+fixtures/
+├── v0-initial.sqlite          # After migration 000
+├── v1-drop-maybe-datum.sqlite # After migration 001
+├── v2-remove-coalesce.sqlite  # After migration 002
+└── README.md                  # How to regenerate fixtures
+#+END_SRC
+
+**** B. Fixture Generation Script
+Create ~packages/memory/test/generate-fixtures.ts~:
+#+BEGIN_SRC typescript
+/**
+ * Generate test database fixtures at each migration level
+ * Run: deno task generate-fixtures
+ */
+import { Database } from "@db/sqlite";
+import * as Space from "../space.ts";
+
+const generateFixture = async (name: string, migrationLevel: number) => {
+  const url = new URL(`./fixtures/${name}.sqlite`, import.meta.url);
+  const db = new Database(url.pathname, { create: true });
+  
+  // Apply migrations up to specified level
+  // ... apply migrations
+  
+  // Insert test data
+  const session = await Space.open({ url });
+  // ... insert known test data
+  
+  return url;
+};
+#+END_SRC
+
+**** C. Backward Compatibility Test Suite
+Create ~packages/memory/test/backward-compatibility-test.ts~:
+#+BEGIN_SRC typescript
+import { assertEquals } from "@std/assert";
+import * as Space from "../space.ts";
+
+Deno.test("v0 database can be opened with current code", async () => {
+  const url = new URL("./fixtures/v0-initial.sqlite", import.meta.url);
+  const result = await Space.open({ url });
+  assert(result.ok, "Should open v0 database");
+  
+  // Verify data integrity
+  const query = await result.ok.query({...});
+  assertEquals(query.ok.selection, expectedData);
+  
+  await result.ok.close();
+});
+
+Deno.test("v1 database can be opened with current code", async () => {
+  // Similar test for v1
+});
+
+Deno.test("v0 database can be migrated to v2", async () => {
+  // Copy fixture to temp location
+  // Run migration
+  // Verify data integrity after migration
+});
+#+END_SRC
+
+**** D. Data Integrity Verification
+#+BEGIN_SRC typescript
+interface TestData {
+  entity: string;
+  expectedValue: unknown;
+  expectedCause: string;
+  since: number;
+}
+
+const verifyDataIntegrity = async (
+  session: SpaceSession,
+  testData: TestData[]
+) => {
+  for (const { entity, expectedValue, expectedCause, since } of testData) {
+    const result = await session.query({
+      select: { [entity]: { "application/json": {} } }
+    });
+    
+    // Verify value matches
+    // Verify cause chain is intact
+    // Verify since values are correct
+  }
+};
+#+END_SRC
+
+** 2. Migration Safety Testing
+
+*** Current Migration System
+
+**** Migration Structure (packages/memory/migrate.ts)
+#+BEGIN_SRC typescript
+// Migration 000: Setup migration tracking table
+// Migration 001: Drop maybe_datum, restructure tables
+// Migration 002: Remove COALESCE, make 'is' NOT NULL
+#+END_SRC
+
+**** Migration Characteristics
+- Uses numbered migration files (000-, 001-, 002-)
+- Wrapped in transactions (~db.transaction(migrate)~)
+- Tracks migration history in ~migration~ table
+- Reads migration status: ~SELECT * FROM migration ORDER BY id DESC LIMIT 1~
+
+**** Migration Concerns
+1. *No rollback mechanism* - Migrations only go forward
+2. *Archive pattern* - Creates _archive tables, drops after migration
+3. *Foreign key handling* - Recreates tables and constraints
+4. *Data migration* - Uses INSERT SELECT with LEFT JOINs
+
+*** Can We Add PRAGMA/WAL Without Breaking Existing Databases?
+
+**** Analysis: Adding PRAGMA Statements
+
+***** PRAGMA foreign_keys = ON
+#+BEGIN_EXAMPLE
+Risk Level: LOW to MEDIUM
+Backward Compatible: YES (if no existing violations)
+#+END_EXAMPLE
+
+- Can be added safely *IF* existing data has no FK violations
+- Should be added at database open time, not in schema
+- Recommendation: Add to ~Space.open()~ and ~Space.connect()~
+
+#+BEGIN_SRC typescript
+// In space.ts, after database creation:
+database.exec("PRAGMA foreign_keys = ON;");
+#+END_SRC
+
+***** Testing for FK violations before enabling:
+#+BEGIN_SRC typescript
+Deno.test("check existing databases for FK violations", async () => {
+  const db = new Database(testDbPath, { create: false });
+  
+  // Check for violations
+  const violations = db.prepare(`
+    PRAGMA foreign_key_check;
+  `).all();
+  
+  assertEquals(violations.length, 0, "No FK violations should exist");
+});
+#+END_SRC
+
+***** PRAGMA journal_mode = WAL
+#+BEGIN_EXAMPLE
+Risk Level: MEDIUM
+Backward Compatible: MOSTLY YES
+#+END_EXAMPLE
+
+- Creates additional ~-wal~ and ~-shm~ files
+- Existing databases can be converted
+- *Potential Issue*: Some file systems don't support WAL
+- *Rollback*: Can switch back to DELETE journal mode
+
+#+BEGIN_SRC typescript
+database.exec("PRAGMA journal_mode = WAL;");
+#+END_SRC
+
+***** Migration Strategy for WAL
+1. *Optional Migration*: Create migration 003-enable-wal.sql
+2. *Test on copy*: Always test on database copy first
+3. *Graceful fallback*: If WAL fails, continue with DELETE mode
+
+#+BEGIN_SRC typescript
+try {
+  const result = database.prepare("PRAGMA journal_mode = WAL;").get();
+  if (result.journal_mode === "wal") {
+    console.log("✅ WAL mode enabled");
+  } else {
+    console.warn("⚠️  WAL mode not available, using default");
+  }
+} catch (error) {
+  console.error("❌ Failed to enable WAL:", error);
+  // Continue with default journal mode
+}
+#+END_SRC
+
+***** Other Recommended PRAGMAs
+#+BEGIN_SRC sql
+-- For better performance
+PRAGMA synchronous = NORMAL;  -- Less safe but faster
+PRAGMA cache_size = -64000;   -- 64MB cache
+PRAGMA temp_store = MEMORY;   -- Keep temp tables in memory
+
+-- For data integrity
+PRAGMA foreign_keys = ON;     -- Enforce FK constraints
+PRAGMA recursive_triggers = ON;
+#+END_SRC
+
+**** Migration Testing Strategy
+
+***** A. Pre-Migration Validation Tests
+#+BEGIN_SRC typescript
+Deno.test("validate database before migration", async () => {
+  const db = new Database(testDbPath);
+  
+  // 1. Check schema version
+  const version = db.prepare(
+    "SELECT id FROM migration ORDER BY id DESC LIMIT 1"
+  ).get();
+  
+  // 2. Check foreign key integrity
+  const fkCheck = db.prepare("PRAGMA foreign_key_check").all();
+  assertEquals(fkCheck.length, 0);
+  
+  // 3. Check table existence
+  const tables = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table'"
+  ).all();
+  assertExists(tables.find(t => t.name === "datum"));
+  assertExists(tables.find(t => t.name === "fact"));
+  assertExists(tables.find(t => t.name === "memory"));
+  
+  // 4. Verify data counts
+  const factCount = db.prepare("SELECT COUNT(*) as count FROM fact").get();
+  const memoryCount = db.prepare("SELECT COUNT(*) as count FROM memory").get();
+  
+  db.close();
+  return { version, factCount, memoryCount };
+});
+#+END_SRC
+
+***** B. Migration Execution Tests
+#+BEGIN_SRC typescript
+Deno.test("migration executes without errors", async () => {
+  const dbPath = await createTestDatabase();
+  const db = new Database(dbPath);
+  
+  // Capture state before migration
+  const beforeState = captureState(db);
+  
+  // Run migration
+  const result = db.transaction(migrate)(db);
+  
+  // Verify migration completed
+  const afterVersion = db.prepare(
+    "SELECT id FROM migration ORDER BY id DESC LIMIT 1"
+  ).get();
+  
+  assertEquals(afterVersion.id, beforeState.version + 1);
+  
+  db.close();
+});
+#+END_SRC
+
+***** C. Post-Migration Validation Tests
+#+BEGIN_SRC typescript
+Deno.test("data integrity preserved after migration", async () => {
+  // Run migration on test database with known data
+  const { before, after } = await runMigrationWithCapture(testDb);
+  
+  // Verify no data loss
+  assertEquals(after.factCount, before.factCount);
+  assertEquals(after.datumCount, before.datumCount);
+  
+  // Verify specific records
+  for (const record of before.sampleRecords) {
+    const afterRecord = after.getRecord(record.id);
+    assertEquals(afterRecord, record, `Record ${record.id} unchanged`);
+  }
+  
+  // Verify cause chains intact
+  for (const { the, of } of before.entities) {
+    const beforeChain = before.getCauseChain(the, of);
+    const afterChain = after.getCauseChain(the, of);
+    assertEquals(afterChain, beforeChain);
+  }
+});
+#+END_SRC
+
+***** D. Migration Rollback/Recovery Tests
+#+BEGIN_SRC typescript
+Deno.test("failed migration can be recovered", async () => {
+  const dbPath = await createTestDatabase();
+  
+  // Inject failure in migration
+  const db = new Database(dbPath);
+  
+  try {
+    db.transaction(() => {
+      // Simulate migration failure
+      db.exec("INSERT INTO fact VALUES ('invalid', ...)");
+      throw new Error("Simulated failure");
+    })();
+  } catch (error) {
+    // Transaction should rollback
+  }
+  
+  // Verify database still in consistent state
+  const version = db.prepare(
+    "SELECT id FROM migration ORDER BY id DESC LIMIT 1"
+  ).get();
+  
+  // Should still be at original version
+  assertEquals(version.id, EXPECTED_VERSION);
+  
+  db.close();
+});
+#+END_SRC
+
+***** E. Cross-Version Compatibility Tests
+#+BEGIN_SRC typescript
+Deno.test("skip migrations work correctly", async () => {
+  // Test migrating from v0 directly to v2
+  const v0db = await loadFixture("v0-initial.sqlite");
+  const result = migrate(v0db);
+  
+  // Should apply migrations 001 and 002
+  const finalVersion = getFinalVersion(v0db);
+  assertEquals(finalVersion, 2);
+  
+  // Verify data integrity
+  verifyDataIntegrity(v0db, expectedData);
+});
+#+END_SRC
+
+** 3. Test Coverage Requirements
+
+*** A. Core Functionality Tests (EXISTS - GOOD COVERAGE)
+✅ Basic CRUD operations (~space-test.ts~, ~memory-test.ts~)
+✅ Conflict detection and handling (~space-test.ts~ lines 332-366, 406-459)
+✅ Concurrent updates (~space-test.ts~ lines 461-486)
+✅ Retraction handling (~space-test.ts~ lines 612-683)
+✅ Batch operations (~space-test.ts~ lines 810-997)
+✅ Schema queries (~space-test.ts~ lines 1182-2264)
+✅ Access control (~consumer-test.ts~ lines 637-843)
+
+*** B. Foreign Key Enforcement Tests (MISSING - CRITICAL)
+
+#+BEGIN_SRC typescript
+// packages/memory/test/foreign-key-test.ts
+
+Deno.test("cannot insert fact with invalid datum reference", async () => {
+  const session = await Space.open({ url: testUrl });
+  
+  // Enable FK enforcement
+  session.store.exec("PRAGMA foreign_keys = ON;");
+  
+  // Try to insert fact with non-existent datum
+  const result = session.store.run(
+    "INSERT INTO fact (this, the, of, 'is', cause, since) VALUES (?, ?, ?, ?, ?, ?)",
+    ["fact1", "application/json", "entity1", "nonexistent_datum", null, 0]
+  );
+  
+  // Should fail with FK constraint violation
+  assertThrows(() => result);
+});
+
+Deno.test("cannot insert memory with invalid fact reference", async () => {
+  const session = await Space.open({ url: testUrl });
+  session.store.exec("PRAGMA foreign_keys = ON;");
+  
+  // Try to insert memory record with non-existent fact
+  assertThrows(() => {
+    session.store.run(
+      "INSERT INTO memory (the, of, fact) VALUES (?, ?, ?)",
+      ["application/json", "entity1", "nonexistent_fact"]
+    );
+  });
+});
+
+Deno.test("CASCADE behavior on fact deletion", async () => {
+  // Test what happens when datum is deleted
+  // Ensure memory table is updated correctly
+});
+#+END_SRC
+
+*** C. Concurrent Access Tests (MISSING - IMPORTANT)
+
+#+BEGIN_SRC typescript
+// packages/memory/test/concurrency-test.ts
+
+Deno.test("multiple processes can read concurrently", async () => {
+  const dbUrl = await createSharedDatabase();
+  
+  // Open multiple sessions
+  const sessions = await Promise.all(
+    Array.from({ length: 10 }, () => Space.open({ url: dbUrl }))
+  );
+  
+  // Run concurrent queries
+  const results = await Promise.all(
+    sessions.map(s => s.ok!.query({ select: { _: { "application/json": {} } } }))
+  );
+  
+  // All should succeed
+  results.forEach(r => assert(r.ok));
+  
+  // Cleanup
+  await Promise.all(sessions.map(s => s.ok!.close()));
+});
+
+Deno.test("write transactions are serialized", async () => {
+  const dbUrl = await createSharedDatabase();
+  
+  // Create consumer with multiple concurrent writes
+  const writes = Array.from({ length: 100 }, (_, i) =>
+    Fact.assert({ the: "application/json", of: `entity-${i}`, is: { i } })
+  );
+  
+  const session = await Space.open({ url: dbUrl });
+  
+  // Submit all writes concurrently
+  const results = await Promise.all(
+    writes.map(fact => session.ok!.transact(
+      Transaction.create({ issuer: alice, subject: space, changes: Changes.from([fact]) })
+    ))
+  );
+  
+  // All should succeed
+  results.forEach(r => assert(r.ok));
+  
+  // Verify all were written
+  const count = session.ok!.store.prepare(
+    "SELECT COUNT(*) as count FROM fact"
+  ).get();
+  assertEquals(count.count, 100);
+});
+
+Deno.test("WAL mode allows concurrent reads during writes", async () => {
+  // Only if WAL mode is enabled
+  const session = await Space.open({ url: testUrl });
+  session.store.exec("PRAGMA journal_mode = WAL;");
+  
+  // Start long-running write transaction
+  const writePromise = session.ok!.transact(largeTransaction);
+  
+  // While write is in progress, perform reads
+  const readPromise = session.ok!.query(readQuery);
+  
+  // Both should complete successfully
+  const [writeResult, readResult] = await Promise.all([writePromise, readPromise]);
+  assert(writeResult.ok && readResult.ok);
+});
+#+END_SRC
+
+*** D. Migration Tests (MISSING - CRITICAL)
+
+Already covered in Section 2.
+
+*** E. Performance Regression Tests (MISSING - RECOMMENDED)
+
+#+BEGIN_SRC typescript
+// packages/memory/test/performance-test.ts
+
+Deno.test("baseline performance for 1000 inserts", async () => {
+  const session = await Space.open({ url: testUrl });
+  
+  const start = performance.now();
+  
+  for (let i = 0; i < 1000; i++) {
+    await session.ok!.transact(createTransaction(i));
+  }
+  
+  const duration = performance.now() - start;
+  const perSecond = 1000 / (duration / 1000);
+  
+  console.log(`Throughput: ${perSecond.toFixed(2)} ops/sec`);
+  
+  // Assert reasonable performance (adjust based on hardware)
+  assert(perSecond > 100, "Should handle at least 100 ops/sec");
+});
+
+Deno.test("query performance with 10k records", async () => {
+  const session = await populateDatabaseWithNRecords(10000);
+  
+  const start = performance.now();
+  const result = await session.query(complexQuery);
+  const duration = performance.now() - start;
+  
+  assert(result.ok);
+  assert(duration < 100, "Query should complete in < 100ms");
+});
+
+Deno.test("index effectiveness", async () => {
+  const session = await Space.open({ url: testUrl });
+  
+  // Query using indexed field
+  const withIndex = await measureQuery(
+    session, 
+    "SELECT * FROM memory WHERE the = 'application/json'"
+  );
+  
+  // Verify index is being used
+  const explainPlan = session.store.prepare(
+    "EXPLAIN QUERY PLAN SELECT * FROM memory WHERE the = 'application/json'"
+  ).all();
+  
+  const usesIndex = explainPlan.some(step => 
+    step.detail.includes("USING INDEX memory_the")
+  );
+  
+  assert(usesIndex, "Query should use memory_the index");
+});
+#+END_SRC
+
+** 4. Practical Testing Approach
+
+*** A. Test Database Creation Utilities
+
+#+BEGIN_SRC typescript
+// packages/memory/test/util.ts
+
+export const createTemporaryDatabase = async (): Promise<URL> => {
+  const tempDir = await Deno.makeTempDir();
+  return new URL(`${tempDir}/test.sqlite`, "file://");
+};
+
+export const createTestDatabaseWithData = async (
+  entities: number = 100
+): Promise<{ url: URL; data: TestData[] }> => {
+  const url = await createTemporaryDatabase();
+  const session = await Space.open({ url });
+  
+  const data: TestData[] = [];
+  for (let i = 0; i < entities; i++) {
+    const fact = Fact.assert({
+      the: "application/json",
+      of: `entity-${i}`,
+      is: { value: i, timestamp: Date.now() }
+    });
+    
+    await session.ok!.transact(
+      Transaction.create({
+        issuer: testDID,
+        subject: testSpace,
+        changes: Changes.from([fact])
+      })
+    );
+    
+    data.push({ entity: `entity-${i}`, fact });
+  }
+  
+  return { url, data };
+};
+
+export const cloneDatabase = async (
+  source: URL,
+  dest: URL
+): Promise<void> => {
+  await Deno.copyFile(
+    new URL(source).pathname,
+    new URL(dest).pathname
+  );
+};
+#+END_SRC
+
+*** B. Data Integrity Verification
+
+#+BEGIN_SRC typescript
+export const verifyDataIntegrity = async (
+  session: SpaceSession,
+  expected: TestData[]
+): Promise<boolean> => {
+  for (const { entity, expectedValue, expectedCause } of expected) {
+    const result = await session.query({
+      select: { [entity]: { "application/json": {} } }
+    });
+    
+    if (!result.ok) return false;
+    
+    const actual = result.ok.selection[session.subject][entity];
+    if (JSON.stringify(actual) !== JSON.stringify(expectedValue)) {
+      console.error(`Mismatch for ${entity}:`, { actual, expected: expectedValue });
+      return false;
+    }
+  }
+  
+  return true;
+};
+
+export const verifyCauseChain = async (
+  session: SpaceSession,
+  entity: { the: string; of: string }
+): Promise<Reference<Fact>[]> => {
+  // Query cause chain from database
+  const stmt = session.store.prepare(CAUSE_CHAIN);
+  const rows = stmt.all(entity);
+  stmt.finalize();
+  
+  return rows.map(r => fromString(r.cause));
+};
+#+END_SRC
+
+*** C. Test Upgrade Path
+
+#+BEGIN_SRC typescript
+// packages/memory/test/upgrade-test.ts
+
+Deno.test("upgrade from each previous version", async () => {
+  const versions = [0, 1, 2]; // All migration versions
+  
+  for (const fromVersion of versions) {
+    const fixture = await loadFixture(`v${fromVersion}.sqlite`);
+    const testDb = await cloneDatabase(fixture, getTempPath());
+    
+    // Run migration
+    const db = new Database(testDb.pathname);
+    migrate(db);
+    
+    // Verify final version
+    const { id } = db.prepare(
+      "SELECT id FROM migration ORDER BY id DESC LIMIT 1"
+    ).get();
+    assertEquals(id, LATEST_VERSION);
+    
+    // Verify data integrity
+    const integrityCheck = db.prepare("PRAGMA integrity_check").get();
+    assertEquals(integrityCheck.integrity_check, "ok");
+    
+    db.close();
+  }
+});
+#+END_SRC
+
+*** D. Continuous Integration Testing
+
+Create ~.github/workflows/memory-tests.yml~:
+#+BEGIN_SRC yaml
+name: Memory Package Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Deno
+        uses: denoland/setup-deno@v1
+        
+      - name: Run unit tests
+        run: deno task test:memory
+        
+      - name: Run migration tests
+        run: deno task test:migrations
+        
+      - name: Run backward compatibility tests
+        run: deno task test:backward-compat
+        
+      - name: Run performance tests
+        run: deno task test:performance
+        
+      - name: Check test coverage
+        run: deno task coverage
+#+END_SRC
+
+* Q9: Additional Considerations
+
+** 1. Database Configuration Issues
+
+*** CRITICAL: No PRAGMA foreign_keys = ON
+
+*Issue*: Foreign keys are defined in schema but NOT enforced by default.
+
+#+BEGIN_EXAMPLE
+File: packages/memory/space.ts
+Lines: 62-135 (PREPARE statement)
+
+Foreign keys defined:
+- fact.'is' REFERENCES datum(this)  
+- memory.fact REFERENCES fact(this)
+
+BUT: No "PRAGMA foreign_keys = ON;" statement found anywhere!
+#+END_EXAMPLE
+
+*Impact*:
+- Orphaned records possible in ~fact~ table (referencing non-existent ~datum~)
+- Orphaned records possible in ~memory~ table (referencing non-existent ~fact~)
+- Data integrity not guaranteed at database level
+- Silent data corruption possible
+
+*Evidence from code search*:
+#+BEGIN_SRC bash
+$ grep -r "PRAGMA" packages/memory/
+# NO RESULTS FOUND
+#+END_SRC
+
+*Recommended Fix*:
+#+BEGIN_SRC typescript
+// In space.ts, after database creation:
+export const open = async <Subject extends MemorySpace>({
+  url,
+}: Options): AsyncResult<Space<Subject>, ConnectionError> => {
+  return await traceAsync("space.open", async (span) => {
+    // ... existing code ...
+    
+    database = await new Database(address ?? ":memory:", {
+      create: true,
+    });
+    
+    // ADD THIS:
+    database.exec("PRAGMA foreign_keys = ON;");
+    
+    database.exec(PREPARE);
+    const session = new Space(subject as Subject, database);
+    return { ok: session };
+  });
+};
+#+END_SRC
+
+*** No WAL Mode - Performance and Concurrency Impact
+
+*Issue*: Using default DELETE journal mode, not Write-Ahead Logging.
+
+*Implications*:
+- Writers block readers (less concurrent access)
+- Slower performance for write-heavy workloads
+- More risk of database corruption on crashes
+
+*Recommended Addition*:
+#+BEGIN_SRC typescript
+database.exec("PRAGMA journal_mode = WAL;");
+database.exec("PRAGMA synchronous = NORMAL;");
+database.exec("PRAGMA cache_size = -64000;"); // 64MB
+#+END_SRC
+
+*** Missing Performance PRAGMAs
+
+#+BEGIN_SRC typescript
+// Recommended pragmas for performance:
+database.exec(`
+  PRAGMA foreign_keys = ON;
+  PRAGMA journal_mode = WAL;
+  PRAGMA synchronous = NORMAL;
+  PRAGMA cache_size = -64000;
+  PRAGMA temp_store = MEMORY;
+  PRAGMA mmap_size = 30000000000;
+`);
+#+END_SRC
+
+** 2. Concurrency and Race Conditions
+
+*** Identified Concurrency Pattern
+
+*File*: ~packages/memory/memory.ts~
+*Lines*: 66-77
+
+#+BEGIN_SRC typescript
+/**
+ * Runs task one at a time, this works around some bug in deno sqlite bindings
+ * which seems to cause problems if query and transaction happen concurrently.
+ */
+async perform<Out>(task: () => Promise<Out>): Promise<Out> {
+  return await traceAsync("memory.perform", async (_span) => {
+    const result = this.ready.finally().then(task);
+    this.ready = result.finally();
+    await this.ready;
+    return await result;
+  });
+}
+#+END_SRC
+
+*Analysis*:
+- ✅ *Good*: Serializes operations to avoid Deno SQLite bugs
+- ⚠️  *Concern*: Comment indicates workaround for known bug
+- ❌ *Issue*: No timeout mechanism - long operations block everything
+- ❌ *Issue*: No priority queue - all operations equal priority
+
+*** Race Condition: Multiple Spaces
+
+*Scenario*:
+#+BEGIN_EXAMPLE
+Process A: Opens space1, performs transaction
+Process B: Opens space1 simultaneously, performs transaction
+
+Without proper locking, both might succeed but create conflicts.
+#+END_EXAMPLE
+
+*Current Mitigation*:
+- SQLite provides transaction-level locking
+- ~session.store.transaction()~ wrapper ensures atomicity
+
+*Potential Issue*:
+- WAL mode allows concurrent readers, but writers still exclusive
+- Multiple processes accessing same database need OS-level file locking
+
+*** Subscriber Notification Race
+
+*File*: ~packages/memory/memory.ts~
+*Lines*: 193-210
+
+#+BEGIN_SRC typescript
+const promises = [];
+// Copy here, in case a subscriber modifies the set of subscribers
+for (const subscriber of [...session.subscribers]) {
+  promises.push(subscriber.commit(result.ok));
+}
+await Promise.all(promises);
+#+END_SRC
+
+*Analysis*:
+- ✅ *Good*: Copies subscriber set to prevent modification during iteration
+- ⚠️  *Concern*: No error handling if subscriber.commit() throws
+- ⚠️  *Concern*: All subscribers notified in parallel - could overwhelm system
+
+*Recommendation*:
+#+BEGIN_SRC typescript
+// Add error handling and rate limiting
+for (const subscriber of [...session.subscribers]) {
+  promises.push(
+    subscriber.commit(result.ok).catch(error => {
+      console.error("Subscriber notification failed:", error);
+      span.recordException(error);
+      // Don't fail the transaction if notification fails
+    })
+  );
+}
+#+END_SRC
+
+** 3. Error Handling Gaps
+
+*** Error Type Analysis
+
+*File*: ~packages/memory/error.ts~
+
+Defined error types:
+1. ~AuthorizationError~ - Access control violations
+2. ~ConflictError~ - CAS conflicts  
+3. ~ConnectionError~ - Database connection failures
+4. ~QueryError~ - Query execution failures
+5. ~TransactionError~ - Transaction failures
+6. ~SystemError~ - Generic system errors
+
+*** Missing Error Scenarios
+
+**** A. Database Corruption
+#+BEGIN_EXAMPLE
+Scenario: SQLite file is corrupted
+Current Behavior: Wrapped in generic ConnectionError or TransactionError
+Recommended: Specific CorruptionError with recovery options
+#+END_EXAMPLE
+
+#+BEGIN_SRC typescript
+export class DatabaseCorruptionError extends Error {
+  name = "DatabaseCorruptionError" as const;
+  
+  constructor(
+    public databasePath: string,
+    public corruption: string,
+    public recoverable: boolean
+  ) {
+    super(`Database corrupted: ${corruption}`);
+  }
+  
+  suggestRecovery(): string[] {
+    if (this.recoverable) {
+      return [
+        "Run PRAGMA integrity_check",
+        "Restore from backup",
+        "Export uncorrupted data"
+      ];
+    }
+    return ["Database must be restored from backup"];
+  }
+}
+#+END_SRC
+
+**** B. Disk Space Exhaustion
+#+BEGIN_EXAMPLE
+Current: Generic SqliteError
+Needed: Specific DiskFullError with cleanup suggestions
+#+END_EXAMPLE
+
+**** C. Schema Mismatch
+#+BEGIN_EXAMPLE
+Scenario: Database schema doesn't match expected version
+Current: Silent failure or generic error
+Needed: SchemaMismatchError suggesting migration
+#+END_EXAMPLE
+
+#+BEGIN_SRC typescript
+export class SchemaMismatchError extends Error {
+  name = "SchemaMismatchError" as const;
+  
+  constructor(
+    public expected: number,
+    public actual: number,
+    public databasePath: string
+  ) {
+    super(`Schema version mismatch: expected ${expected}, found ${actual}`);
+  }
+  
+  needsMigration(): boolean {
+    return this.actual < this.expected;
+  }
+}
+#+END_SRC
+
+**** D. Locked Database Timeout
+#+BEGIN_EXAMPLE
+Current: SqliteError code SQLITE_BUSY
+Needed: Retry logic with exponential backoff
+#+END_EXAMPLE
+
+*** Transaction Error Recovery
+
+*Current Behavior* (~space.ts~ lines 836-849):
+#+BEGIN_SRC typescript
+try {
+  return { ok: update(session, transaction) };
+} catch (error) {
+  return (error as Error).name === "ConflictError"
+    ? { error: error as ToJSON<ConflictError> }
+    : { error: Error.transaction(transaction, error as SqliteError) };
+}
+#+END_SRC
+
+*Issues*:
+- Only distinguishes ConflictError
+- All other errors become generic TransactionError
+- No retry logic for transient failures (SQLITE_BUSY, SQLITE_LOCKED)
+
+*Recommended Enhancement*:
+#+BEGIN_SRC typescript
+const RETRYABLE_CODES = ["SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_IOERR"];
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 100;
+
+const executeWithRetry = async (
+  fn: () => Result,
+  retries: number = MAX_RETRIES
+): Promise<Result> => {
+  try {
+    return fn();
+  } catch (error) {
+    const sqliteError = error as SqliteError;
+    
+    if (RETRYABLE_CODES.includes(sqliteError.code) && retries > 0) {
+      await sleep(RETRY_DELAY_MS * (MAX_RETRIES - retries + 1));
+      return executeWithRetry(fn, retries - 1);
+    }
+    
+    throw error;
+  }
+};
+#+END_SRC
+
+** 4. Data Integrity Concerns
+
+*** No Explicit Integrity Checks
+
+*Missing*:
+- Regular ~PRAGMA integrity_check~ execution
+- Checksum validation
+- Backup verification
+
+*Recommendation*: Add periodic integrity check
+#+BEGIN_SRC typescript
+export const checkIntegrity = (session: Session): IntegrityResult => {
+  const result = session.store.prepare("PRAGMA integrity_check").all();
+  
+  return {
+    ok: result.length === 1 && result[0].integrity_check === "ok",
+    details: result,
+    timestamp: Date.now()
+  };
+};
+
+// Run on database open
+export const open = async (options: Options) => {
+  // ... existing code ...
+  
+  const integrity = checkIntegrity(session);
+  if (!integrity.ok) {
+    console.error("Database integrity check failed:", integrity.details);
+    span.setAttribute("database.integrity", "failed");
+  }
+  
+  return { ok: session };
+};
+#+END_SRC
+
+*** Foreign Key Constraint Violations
+
+*Current State*: FK constraints defined but not enforced (see Section 2.1)
+
+*Risk*:
+#+BEGIN_EXAMPLE
+1. fact.is can reference non-existent datum
+2. memory.fact can reference non-existent fact  
+3. Orphaned records accumulate over time
+4. Cascading deletes don't work
+#+END_EXAMPLE
+
+*Verification Test*:
+#+BEGIN_SRC typescript
+Deno.test("detect foreign key violations in existing database", async () => {
+  const session = await Space.open({ url: existingDbUrl });
+  
+  // Enable FK checking temporarily
+  session.store.exec("PRAGMA foreign_keys = ON;");
+  
+  // Run FK check
+  const violations = session.store.prepare(
+    "PRAGMA foreign_key_check"
+  ).all();
+  
+  if (violations.length > 0) {
+    console.error("FK violations found:", violations);
+  }
+  
+  assertEquals(violations.length, 0, "No FK violations should exist");
+});
+#+END_SRC
+
+*** Cause Chain Integrity
+
+*File*: ~space.ts~ lines 174-180 (CAUSE_CHAIN query)
+
+*Current Implementation*:
+- Recursive CTE to follow cause chain
+- Used for conflict detection
+
+*Concerns*:
+- No validation that cause chain is acyclic
+- Possible infinite loop if circular reference exists
+- No maximum depth limit
+
+*Risk Scenario*:
+#+BEGIN_EXAMPLE
+fact1 -> fact2 -> fact3 -> fact1  (circular)
+Cause chain query could hang
+#+END_EXAMPLE
+
+*Recommended Safeguards*:
+#+BEGIN_SRC typescript
+const CAUSE_CHAIN_WITH_DEPTH_LIMIT = `
+WITH RECURSIVE cause_of(c, f, depth) AS (
+  SELECT cause, this, 0 FROM fact 
+  WHERE fact.of = :of AND fact.the = :the
+  
+  UNION
+  
+  SELECT cause, this, depth + 1 FROM fact, cause_of 
+  WHERE fact.this = cause_of.c
+  AND depth < 1000  -- Prevent infinite loops
+)
+SELECT c as cause, f as fact, depth FROM cause_of
+WHERE depth < 1000
+`;
+#+END_SRC
+
+*** Data Consistency Under Concurrent Load
+
+*Current Testing*: Some concurrent tests exist (~space-test.ts~)
+*Missing*:
+- Stress tests with high concurrency
+- Tests with multiple processes
+- Tests with sudden process termination
+
+*Recommendation*:
+#+BEGIN_SRC typescript
+// packages/memory/test/stress-test.ts
+
+Deno.test("consistency under concurrent writes", async () => {
+  const session = await Space.open({ url: testUrl });
+  
+  const writers = 10;
+  const writesPerWriter = 100;
+  
+  const allWrites = Array.from({ length: writers }, (_, w) =>
+    Array.from({ length: writesPerWriter }, (_, i) => ({
+      writer: w,
+      index: i,
+      fact: Fact.assert({
+        the: "application/json",
+        of: `entity-${w}-${i}`,
+        is: { writer: w, index: i, timestamp: Date.now() }
+      })
+    }))
+  );
+  
+  // Execute all writes concurrently
+  const results = await Promise.all(
+    allWrites.flat().map(({ fact }) =>
+      session.ok!.transact(
+        Transaction.create({
+          issuer: testDID,
+          subject: testSpace,
+          changes: Changes.from([fact])
+        })
+      )
+    )
+  );
+  
+  // Verify all succeeded
+  const failures = results.filter(r => r.error);
+  assertEquals(failures.length, 0);
+  
+  // Verify database consistency
+  const count = session.ok!.store.prepare(
+    "SELECT COUNT(*) as count FROM fact"
+  ).get();
+  assertEquals(count.count, writers * writesPerWriter);
+  
+  // Verify no duplicate entities
+  const uniqueEntities = session.ok!.store.prepare(
+    "SELECT COUNT(DISTINCT of) as count FROM memory"
+  ).get();
+  assertEquals(uniqueEntities.count, writers * writesPerWriter);
+});
+#+END_SRC
+
+** 5. Security Considerations
+
+*** SQL Injection Protection
+
+*Current State*: Uses prepared statements ✅
+
+*Examples from code*:
+#+BEGIN_SRC typescript
+// Good: Parameterized queries
+stmt.get({ the, of })
+session.store.run(IMPORT_FACT, { this, the, of, is, cause, since })
+#+END_SRC
+
+*Verification Needed*:
+- Audit all dynamic SQL generation
+- Ensure no string concatenation with user input
+
+*** Access Control
+
+*Implementation*: ~packages/memory/access.ts~
+*Coverage*:
+- Authorization via UCAN tokens
+- DID-based access control
+- Authorization error handling
+
+*Potential Issues*:
+1. *No rate limiting* - DoS via excessive queries
+2. *No audit logging* - Can't track unauthorized access attempts
+3. *No session management* - Long-lived tokens
+
+*Recommendations*:
+#+BEGIN_SRC typescript
+// Add rate limiting
+interface RateLimitConfig {
+  maxRequestsPerMinute: number;
+  maxConcurrentRequests: number;
+}
+
+class RateLimiter {
+  private requests: Map<string, number[]> = new Map();
+  
+  checkLimit(did: string, config: RateLimitConfig): boolean {
+    const now = Date.now();
+    const recent = this.requests.get(did)?.filter(
+      t => now - t < 60000
+    ) || [];
+    
+    if (recent.length >= config.maxRequestsPerMinute) {
+      return false;
+    }
+    
+    recent.push(now);
+    this.requests.set(did, recent);
+    return true;
+  }
+}
+
+// Add audit logging
+interface AuditLog {
+  timestamp: number;
+  did: string;
+  operation: string;
+  space: string;
+  success: boolean;
+  error?: string;
+}
+
+const auditLog = (entry: AuditLog) => {
+  console.log(JSON.stringify(entry));
+  // Could also write to separate audit database
+};
+#+END_SRC
+
+*** Sensitive Data Leakage
+
+*Concern*: Error messages may leak sensitive information
+
+*Example* (~error.ts~ lines 72-86):
+#+BEGIN_SRC typescript
+super(
+  conflict.expected == null
+    ? `The ${conflict.the} of ${conflict.of} in ${conflict.space} already exists as ${refer(actual)}`
+    : // ... includes entity identifiers and references
+)
+#+END_SRC
+
+*Issue*: Error messages include:
+- Entity identifiers
+- Content hashes
+- Space identifiers
+
+*Recommendation*:
+- Add option to sanitize errors for production
+- Separate detailed errors (for logs) from user-facing errors
+
+** 6. Operational Concerns
+
+*** Backup and Restore
+
+*Current State*: NO BUILT-IN BACKUP MECHANISM
+
+*Risks*:
+- Data loss if file corruption
+- No point-in-time recovery
+- Manual backup required
+
+*Recommendation*: Implement backup utilities
+
+#+BEGIN_SRC typescript
+// packages/memory/backup.ts
+
+export interface BackupOptions {
+  destination: URL;
+  compress?: boolean;
+  verify?: boolean;
+}
+
+export const backup = async (
+  session: SpaceSession,
+  options: BackupOptions
+): Promise<Result<BackupInfo, Error>> => {
+  const { store } = session;
+  
+  // Use SQLite backup API
+  const backupDb = new Database(options.destination.pathname, {
+    create: true
+  });
+  
+  try {
+    // Copy database using backup API
+    store.exec(`VACUUM INTO '${options.destination.pathname}'`);
+    
+    // Verify integrity of backup
+    if (options.verify) {
+      const integrity = backupDb.prepare("PRAGMA integrity_check").get();
+      if (integrity.integrity_check !== "ok") {
+        return { error: new Error("Backup verification failed") };
+      }
+    }
+    
+    return {
+      ok: {
+        path: options.destination.pathname,
+        timestamp: Date.now(),
+        size: await Deno.stat(options.destination).then(s => s.size)
+      }
+    };
+  } finally {
+    backupDb.close();
+  }
+};
+
+export const restore = async (
+  backupPath: URL,
+  destination: URL
+): Promise<Result<void, Error>> => {
+  // Verify backup integrity before restore
+  const backup = new Database(backupPath.pathname, { create: false });
+  const integrity = backup.prepare("PRAGMA integrity_check").get();
+  backup.close();
+  
+  if (integrity.integrity_check !== "ok") {
+    return { error: new Error("Backup file is corrupted") };
+  }
+  
+  // Copy backup to destination
+  await Deno.copyFile(backupPath.pathname, destination.pathname);
+  
+  return { ok: undefined };
+};
+#+END_SRC
+
+*** Database Growth and Cleanup
+
+*Issue*: No mechanism to clean up old history
+
+*Current Behavior*:
+- All facts kept forever (lines in ~space.ts~)
+- History grows unbounded
+- ~datum~ table accumulates unused JSON blobs
+
+*Recommendation*: Implement retention policy
+
+#+BEGIN_SRC typescript
+export interface RetentionPolicy {
+  maxFactAge?: number; // milliseconds
+  maxFactsPerEntity?: number;
+  keepCommits?: boolean;
+}
+
+export const applyRetentionPolicy = (
+  session: Session,
+  policy: RetentionPolicy
+): { deleted: { facts: number; datums: number } } => {
+  const db = session.store;
+  
+  db.transaction(() => {
+    // Delete old facts beyond retention period
+    if (policy.maxFactAge) {
+      const cutoff = Date.now() / 1000 - policy.maxFactAge / 1000;
+      db.run(`
+        DELETE FROM fact 
+        WHERE since < ? 
+        AND this NOT IN (SELECT fact FROM memory)
+      `, [cutoff]);
+    }
+    
+    // Keep only N most recent facts per entity
+    if (policy.maxFactsPerEntity) {
+      // Complex query to identify and delete old facts
+    }
+    
+    // Clean up unreferenced datums
+    db.run(`
+      DELETE FROM datum 
+      WHERE this NOT IN (SELECT 'is' FROM fact)
+      AND this != 'undefined'
+    `);
+    
+    // Reclaim space
+    db.exec("VACUUM");
+  })();
+  
+  return {
+    deleted: {
+      facts: db.changes(),
+      datums: db.changes()
+    }
+  };
+};
+#+END_SRC
+
+*** Monitoring and Observability
+
+*Current State*: Good telemetry framework (~telemetry.ts~)
+
+*Implemented*:
+- OpenTelemetry integration
+- Span tracking for operations
+- Error recording
+- Configurable sampling
+
+*Missing*:
+- Metrics export (only traces)
+- Database statistics collection
+- Performance metrics
+
+*Recommendation*: Add metrics
+
+#+BEGIN_SRC typescript
+// packages/memory/metrics.ts
+
+import { metrics } from "@opentelemetry/api";
+
+const meter = metrics.getMeter("common-memory");
+
+export const databaseMetrics = {
+  queryDuration: meter.createHistogram("memory.query.duration", {
+    description: "Query execution time",
+    unit: "ms"
+  }),
+  
+  transactionDuration: meter.createHistogram("memory.transaction.duration", {
+    description: "Transaction execution time",
+    unit: "ms"
+  }),
+  
+  databaseSize: meter.createObservableGauge("memory.database.size", {
+    description: "Database file size",
+    unit: "bytes"
+  }),
+  
+  factCount: meter.createObservableGauge("memory.facts.total", {
+    description: "Total number of facts"
+  }),
+  
+  conflictCount: meter.createCounter("memory.conflicts.total", {
+    description: "Total number of conflicts"
+  })
+};
+
+export const collectDatabaseStats = (session: Session) => {
+  const stats = session.store.prepare(`
+    SELECT 
+      (SELECT COUNT(*) FROM fact) as facts,
+      (SELECT COUNT(*) FROM datum) as datums,
+      (SELECT COUNT(*) FROM memory) as entities,
+      (SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()) as size
+  `).get();
+  
+  return stats;
+};
+#+END_SRC
+
+*** Corruption Detection and Recovery
+
+*Current State*: NO PROACTIVE CORRUPTION DETECTION
+
+*Recommendation*: Implement health checks
+
+#+BEGIN_SRC typescript
+export interface HealthCheck {
+  healthy: boolean;
+  checks: {
+    integrity: boolean;
+    foreignKeys: boolean;
+    indexes: boolean;
+  };
+  warnings: string[];
+  errors: string[];
+}
+
+export const healthCheck = async (
+  session: Session
+): Promise<HealthCheck> => {
+  const warnings: string[] = [];
+  const errors: string[] = [];
+  
+  // Check 1: Database integrity
+  const integrityResult = session.store.prepare(
+    "PRAGMA integrity_check"
+  ).get();
+  const integrity = integrityResult.integrity_check === "ok";
+  
+  if (!integrity) {
+    errors.push(`Integrity check failed: ${integrityResult.integrity_check}`);
+  }
+  
+  // Check 2: Foreign key violations
+  const fkViolations = session.store.prepare(
+    "PRAGMA foreign_key_check"
+  ).all();
+  const foreignKeys = fkViolations.length === 0;
+  
+  if (!foreignKeys) {
+    errors.push(`${fkViolations.length} foreign key violations found`);
+  }
+  
+  // Check 3: Index integrity
+  const indexes = session.store.prepare(
+    "SELECT name FROM sqlite_master WHERE type='index'"
+  ).all();
+  const expectedIndexes = ["memory_the", "memory_of", "fact_since"];
+  const indexesOk = expectedIndexes.every(name =>
+    indexes.some(idx => idx.name === name)
+  );
+  
+  if (!indexesOk) {
+    warnings.push("Some indexes are missing");
+  }
+  
+  // Check 4: Database stats
+  const stats = collectDatabaseStats(session);
+  if (stats.size > 1_000_000_000) { // 1GB
+    warnings.push("Database size exceeds 1GB");
+  }
+  
+  return {
+    healthy: integrity && foreignKeys && indexesOk && errors.length === 0,
+    checks: { integrity, foreignKeys, indexes: indexesOk },
+    warnings,
+    errors
+  };
+};
+#+END_SRC
+
+** 7. Edge Cases and Boundary Conditions
+
+*** Empty Database Initialization
+
+*Tested*: ✅ (~space-test.ts~ lines 1061-1078)
+
+*** Maximum Entity Size
+
+*Issue*: No limit on JSON size for ~datum.source~
+
+*Risk*:
+- Large JSON objects can slow down queries
+- Memory exhaustion possible
+- SQLite has default limits (~1GB~)
+
+*Recommendation*:
+#+BEGIN_SRC typescript
+const MAX_DATUM_SIZE = 10 * 1024 * 1024; // 10MB
+
+const validateDatumSize = (datum: JSONValue): Result<void, Error> => {
+  const size = JSON.stringify(datum).length;
+  if (size > MAX_DATUM_SIZE) {
+    return {
+      error: new Error(`Datum too large: ${size} bytes (max ${MAX_DATUM_SIZE})`)
+    };
+  }
+  return { ok: undefined };
+};
+#+END_SRC
+
+*** Cause Chain Depth Limit
+
+*Issue*: No limit on cause chain depth (see Section 4.3)
+
+*Recommendation*: Add depth limit to recursive query
+
+*** Concurrent Identical Writes
+
+*Tested*: ✅ (~space-test.ts~ lines 461-531)
+*Behavior*: Idempotent writes succeed
+
+*** Unicode and Special Characters
+
+*Concern*: Entity identifiers with special characters
+
+*Test*:
+#+BEGIN_SRC typescript
+Deno.test("entity with unicode characters", async () => {
+  const entity = "entity-🎉-测试-مرحبا";
+  const fact = Fact.assert({
+    the: "application/json",
+    of: entity,
+    is: { test: "unicode" }
+  });
+  
+  const result = await session.transact(
+    Transaction.create({ issuer, subject, changes: Changes.from([fact]) })
+  );
+  
+  assert(result.ok);
+  
+  // Verify can query back
+  const query = await session.query({
+    select: { [entity]: { "application/json": {} } }
+  });
+  
+  assert(query.ok);
+});
+#+END_SRC
+
+* Recommendations Prioritized by Severity
+
+** P0 - CRITICAL (Must Fix Before Production)
+
+1. *Enable Foreign Key Constraints*
+   - Add ~PRAGMA foreign_keys = ON;~ in ~space.ts~
+   - Add test to verify FK enforcement
+   - Run FK check on all existing databases
+
+2. *Add Migration Tests*
+   - Test backward compatibility with fixtures
+   - Test data integrity across migrations
+   - Test rollback scenarios
+
+3. *Implement Database Health Checks*
+   - Run ~PRAGMA integrity_check~ on open
+   - Detect and report corruption
+   - Provide recovery options
+
+** P1 - HIGH (Should Fix Soon)
+
+4. *Enable WAL Mode*
+   - Add ~PRAGMA journal_mode = WAL;~
+   - Test concurrent access patterns
+   - Document implications
+
+5. *Add Retry Logic for Transient Errors*
+   - Handle SQLITE_BUSY and SQLITE_LOCKED
+   - Exponential backoff
+   - Configurable max retries
+
+6. *Implement Backup/Restore*
+   - Automated backup mechanism
+   - Point-in-time recovery
+   - Backup verification
+
+7. *Add Performance Metrics*
+   - Export OpenTelemetry metrics
+   - Monitor database size growth
+   - Track query performance
+
+** P2 - MEDIUM (Nice to Have)
+
+8. *Add Concurrency Tests*
+   - Multi-process tests
+   - High-concurrency stress tests
+   - Race condition detection
+
+9. *Implement Retention Policy*
+   - Clean up old history
+   - Remove unreferenced datums
+   - Configurable retention rules
+
+10. *Add Rate Limiting*
+    - Prevent DoS
+    - Per-DID limits
+    - Configurable thresholds
+
+11. *Improve Error Messages*
+    - Sanitize for production
+    - Better categorization
+    - Recovery suggestions
+
+** P3 - LOW (Future Enhancements)
+
+12. *Add Audit Logging*
+    - Track all operations
+    - Security event logging
+    - Compliance support
+
+13. *Implement Data Size Limits*
+    - Max datum size
+    - Max cause chain depth
+    - Max entities per space
+
+14. *Add Database Statistics*
+    - Growth trends
+    - Query patterns
+    - Performance baselines
+
+* Testing Checklist Summary
+
+** Before Deploying Changes
+
+- [ ] Run all existing tests
+- [ ] Add backward compatibility tests with fixtures
+- [ ] Test foreign key enforcement (if enabling)
+- [ ] Test WAL mode (if enabling)
+- [ ] Run migration tests on copies of production databases
+- [ ] Verify data integrity after migrations
+- [ ] Test rollback scenarios
+- [ ] Run performance benchmarks
+- [ ] Test concurrent access patterns
+- [ ] Verify error handling for all new features
+
+** Continuous Testing
+
+- [ ] Add CI/CD pipeline for tests
+- [ ] Run tests on multiple platforms
+- [ ] Test with different SQLite versions
+- [ ] Monitor test coverage
+- [ ] Run stress tests regularly
+- [ ] Test backup/restore regularly
+
+** Production Monitoring
+
+- [ ] Enable health checks
+- [ ] Monitor database integrity
+- [ ] Track performance metrics
+- [ ] Alert on errors
+- [ ] Regular backups
+- [ ] Test restore procedures
+
+* Files Requiring Changes
+
+** Immediate Changes
+
+1. ~/packages/memory/space.ts~
+   - Line 332-335: Add PRAGMA statements in ~connect()~
+   - Line 367-370: Add PRAGMA statements in ~open()~
+   - Line 174-180: Add depth limit to CAUSE_CHAIN query
+
+2. ~/packages/memory/migrate.ts~
+   - Add migration for enabling pragmas
+   - Add validation before/after migration
+
+** New Files to Create
+
+1. ~/packages/memory/test/backward-compatibility-test.ts~
+2. ~/packages/memory/test/foreign-key-test.ts~
+3. ~/packages/memory/test/concurrency-test.ts~
+4. ~/packages/memory/test/performance-test.ts~
+5. ~/packages/memory/test/fixtures/~ (directory)
+6. ~/packages/memory/test/generate-fixtures.ts~
+7. ~/packages/memory/backup.ts~
+8. ~/packages/memory/health.ts~
+9. ~/packages/memory/metrics.ts~
+
+** Configuration Changes
+
+1. ~packages/memory/deno.json~
+   - Add test tasks
+   - Add migration tasks
+
+2. ~.github/workflows/memory-tests.yml~ (new)
+   - CI/CD for tests
+
+* Appendix: Key File Locations
+
+** Core Implementation
+- ~/packages/memory/space.ts~ - Database operations (1100+ lines)
+- ~/packages/memory/memory.ts~ - Session management (304 lines)
+- ~/packages/memory/migrate.ts~ - Migration system (88 lines)
+- ~/packages/memory/error.ts~ - Error types (194 lines)
+- ~/packages/memory/telemetry.ts~ - Observability (237 lines)
+
+** Tests
+- ~/packages/memory/test/space-test.ts~ - Space tests (2265 lines)
+- ~/packages/memory/test/memory-test.ts~ - Memory tests (425 lines)
+- ~/packages/memory/test/consumer-test.ts~ - Consumer tests (1420 lines)
+- ~/packages/memory/test/access-test.ts~ - Access control tests (127 lines)
+- ~/packages/memory/test/stress-debug.ts~ - Stress testing (114 lines)
+
+** Migrations
+- ~/packages/memory/migrations/000-setup-migrations.sql~
+- ~/packages/memory/migrations/001-drop-maybe_datum.sql~
+- ~/packages/memory/migrations/002-remove_coalesce.sql~
+
+** Documentation
+- ~/packages/memory/README.md~ - Package overview (242 lines)
+
+* Conclusion
+
+The packages/memory codebase is well-structured with good test coverage for basic functionality. However, it has critical gaps in:
+
+1. *Database configuration* - Foreign keys not enforced, no WAL mode
+2. *Migration testing* - No backward compatibility tests
+3. *Concurrency handling* - Limited testing, workarounds for known bugs
+4. *Operational readiness* - No backup/restore, limited monitoring
+
+Priority should be given to P0 and P1 items to ensure data integrity and production readiness.
+
+The testing strategy outlined in this document provides a comprehensive approach to:
+- Ensure backward compatibility
+- Validate migrations safely
+- Test concurrency scenarios
+- Verify data integrity
+- Monitor performance
+
+Implementation of these recommendations will significantly improve the robustness and reliability of the memory system.

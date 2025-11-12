@@ -1,0 +1,702 @@
+#+TITLE: Q5: Fact Table Growth and Performance Impact Analysis
+#+AUTHOR: Research Analysis
+#+DATE: 2025-11-12
+#+OPTIONS: toc:2 num:3
+
+* Executive Summary
+
+The =fact= table in packages/memory/space.ts implements an append-only event
+log that grows indefinitely with every assertion and retraction. Analysis
+reveals:
+
+- *Growth Rate*: Linear growth at 1 row per assertion/retraction operation
+- *Performance Impact*: Minimal for most queries due to clever architecture
+- *Critical Issue*: CAUSE_CHAIN query performs full table scan (missing index)
+- *Overall Design*: Well-optimized for primary use case (current state queries)
+
+The system is designed around a key insight: most queries operate on *current
+state* via the =memory= table, which has constant size. Only historical queries
+(CAUSE_CHAIN, direct fact lookups) scan the growing =fact= table.
+
+* Growth Rate Analysis
+
+** Schema Overview
+
+The =fact= table stores complete history (space.ts:80-90):
+
+#+BEGIN_SRC sql
+CREATE TABLE IF NOT EXISTS fact (
+  this    TEXT NOT NULL PRIMARY KEY,  -- Merkle reference (content-addressed)
+  the     TEXT NOT NULL,              -- MIME type (e.g., "application/json")
+  of      TEXT NOT NULL,              -- Entity identifier
+  'is'    TEXT NOT NULL,              -- Merkle reference to datum or "undefined"
+  cause   TEXT,                       -- Causal reference to prior fact
+  since   INTEGER NOT NULL,           -- Lamport clock timestamp
+  FOREIGN KEY('is') REFERENCES datum(this)
+);
+#+END_SRC
+
+** Growth Patterns
+
+*** One Row Per Operation
+
+Every state change adds exactly one row:
+- *Assertion*: =fact.is= points to datum → +1 row
+- *Retraction*: =fact.is = "undefined"= → +1 row  
+- *No Deletions*: Rows never removed (append-only log)
+
+*** Typical Workload Examples
+
+From test suite analysis:
+
+**** Basic CRUD (space-test.ts)
+- Create document: +1 fact row
+- Update document: +1 fact row (new version)
+- Retract document: +1 fact row (marks as undefined)
+- *Total*: 3 operations = 3 fact rows
+
+**** Batch Operations (space-test.ts:810-997)
+- Initialize 2 documents: +2 fact rows
+- Update 1, create 1, claim 1: +3 fact rows
+- *Total*: 2 transactions, 5 operations = 5 fact rows
+
+**** Stress Test (stress-debug.ts:26-111)
+- Create 2000 event documents: +2000 fact rows
+- Create 1 list document: +1 fact row
+- *Total*: 2001 fact rows in single transaction
+
+** Growth Rate Formula
+
+For a workload with:
+- N entities being tracked
+- Average M updates per entity over lifetime
+- R retractions
+
+*Fact table size* = N × (1 + M) + R rows
+
+*** Example: Todo App
+- 1000 todos created
+- Average 5 edits each
+- 200 todos deleted
+
+Size = 1000 × (1 + 5) + 200 = *6,200 fact rows*
+
+*** Example: Real-time Collaboration
+- 50 active documents
+- 100 edits/day per document
+- 30 days
+
+Size = 50 × 101 × 30 = *151,500 fact rows/month*
+
+** Memory vs Fact Table Size
+
+Key insight: =memory= table maintains *constant* size:
+- Memory size = number of *current* entities
+- Fact size = number of *historical* operations
+
+For N entities with M updates each:
+- Memory rows: N (constant)
+- Fact rows: N × M (grows with history)
+
+* Query Performance Analysis
+
+** Index Structure
+
+*** Fact Table Indexes (space.ts:89-90)
+#+BEGIN_SRC sql
+CREATE INDEX IF NOT EXISTS fact_since ON fact (since);
+#+END_SRC
+
+⚠️ *CRITICAL*: Only ONE index on fact table!
+- Indexed: =since= (Lamport timestamp)
+- *NOT indexed*: =the=, =of=, =cause=, =is=
+
+*** Memory Table Indexes (space.ts:106-108)
+#+BEGIN_SRC sql
+CREATE INDEX IF NOT EXISTS memory_the ON memory (the);
+CREATE INDEX IF NOT EXISTS memory_of ON memory (of);
+#+END_SRC
+
+Primary key: =(the, of)= - uniquely identifies current state
+
+** Query-by-Query Analysis
+
+*** 1. EXPORT Query (space.ts:154-171)
+
+#+BEGIN_SRC sql
+SELECT
+  state.the, state.of, state.'is', state.cause, state.since, state.fact
+FROM state
+WHERE
+  (:the IS NULL OR state.the = :the)
+  AND (:of IS NULL OR state.of = :of)
+  AND (:is IS NULL OR state.'is' IS NOT NULL)
+  AND (:cause is NULL OR state.cause = :cause)
+  AND (:since is NULL or state.since > :since)
+ORDER BY since ASC
+#+END_SRC
+
+*Performance*: ✅ *EXCELLENT*
+
+*Query Plan Analysis*:
+1. Uses =state= VIEW which joins: memory → fact → datum
+2. *Driver table*: =memory= (smallest, ~N rows for N entities)
+3. Joins use primary/foreign keys:
+   - =memory.fact = fact.this= → uses fact.this PRIMARY KEY
+   - =fact.'is' = datum.this= → uses datum.this PRIMARY KEY
+4. WHERE filters applied on indexed memory table
+5. ORDER BY =since= can use =fact_since= index
+
+*Cost*: O(N) where N = current entities
+*Does NOT scale with fact table size!*
+
+*** 2. CAUSE_CHAIN Query (space.ts:174-180)
+
+#+BEGIN_SRC sql
+WITH RECURSIVE cause_of(c, f) AS (
+    SELECT cause, this FROM fact 
+    WHERE fact.of = :of AND fact.the = :the
+    UNION
+    SELECT cause, this FROM fact, cause_of 
+    WHERE fact.this = cause_of.c
+  )
+SELECT c as cause, f as fact FROM cause_of
+#+END_SRC
+
+*Performance*: ❌ *POOR* (FULL TABLE SCAN)
+
+*Query Plan Analysis*:
+1. Anchor query: =WHERE fact.of = :of AND fact.the = :the=
+2. ⚠️ *NO INDEX on (of, the)* → *FULL TABLE SCAN*
+3. Recursive part: =WHERE fact.this = cause_of.c= → uses PRIMARY KEY ✅
+4. Cost: O(F) for anchor + O(D) for recursion
+   - F = total fact rows (scans entire table!)
+   - D = depth of cause chain (typically 1-20)
+
+*Scaling Impact*:
+- 1K fact rows: ~1ms (acceptable)
+- 100K fact rows: ~100ms (noticeable lag)
+- 1M fact rows: ~1s+ (unacceptable)
+
+*Current Usage*: Function =_causeChain= (space.ts:459-484)
+- Currently *DISABLED* for performance (see line 759-760)
+- Used for conflict resolution error messages
+- Called when CAS operation fails
+
+*** 3. GET_FACT Query (space.ts:183-197)
+
+#+BEGIN_SRC sql
+SELECT
+  fact.the, fact.of, datum.source AS 'is',
+  fact.cause, fact.this, datum.this AS proof, fact.since
+FROM fact
+JOIN datum ON datum.this = fact.'is'
+WHERE fact.this = :fact
+#+END_SRC
+
+*Performance*: ✅ *EXCELLENT*
+
+*Query Plan*:
+1. =WHERE fact.this = :fact= → uses PRIMARY KEY index
+2. Join on =datum.this= → uses PRIMARY KEY
+3. Cost: O(1) - constant time lookup
+
+*Usage*: Function =getFact= (space.ts:494-523)
+- Used internally by =_causeChain=
+- Direct fact lookup by reference
+
+*** 4. State VIEW (space.ts:113-132)
+
+Not a query itself, but defines the primary view for current state.
+
+*Performance*: ✅ *EXCELLENT* (when filtered properly)
+
+Structure:
+- Driven by =memory= table (current state only)
+- Joins use primary/foreign keys
+- Efficient for all current-state queries
+
+** Query Performance Summary Table
+
+| Query        | Access Pattern      | Index Used       | Scales With | Performance |
+|--------------+---------------------+------------------+-------------+-------------|
+| EXPORT       | memory → fact       | PK, FK           | Current     | Excellent   |
+| CAUSE_CHAIN  | fact(of, the) scan  | *NONE*           | History     | *Poor*      |
+| GET_FACT     | fact.this           | PRIMARY KEY      | O(1)        | Excellent   |
+| State VIEW   | memory driven       | PK, FK           | Current     | Excellent   |
+
+* SQLite Performance Characteristics
+
+** Index Performance
+
+From SQLite documentation and benchmarks:
+
+*** B-Tree Index Lookups
+- PRIMARY KEY: O(log N) - typically 3-4 disk reads
+- Secondary index: O(log N) + 1 (index + table lookup)
+- Composite index: Same as single column if prefix matches
+
+*Real-world timing*:
+- 1K rows: <1ms per lookup
+- 1M rows: ~2ms per lookup
+- 10M rows: ~3ms per lookup
+
+*** Table Scans
+- Linear scan: O(N) - reads every row
+- Cost: ~1-10μs per row (depends on row size, disk speed)
+
+*Real-world timing*:
+- 10K rows: ~10-100ms
+- 100K rows: ~100ms-1s
+- 1M rows: ~1-10s
+
+** Does Table Size Matter?
+
+*** With Indexes: NO (mostly)
+- Index lookups are O(log N) - scales logarithmically
+- 10x more data → +1 level in B-tree → ~25% slower
+- *Database file size doesn't matter for indexed queries*
+
+*** Without Indexes: YES (linear)
+- Full table scans are O(N) - scales linearly
+- 10x more data → 10x slower
+- This is the problem with CAUSE_CHAIN!
+
+** SQLite Optimization
+
+SQLite query optimizer:
+1. Analyzes indexes and WHERE clauses
+2. Chooses lowest-cost query plan
+3. Prefers indexes when available
+4. Falls back to table scan when no index matches
+
+For =WHERE fact.of = :of AND fact.the = :the=:
+- Ideal: Composite index on (of, the)
+- Actual: No index → full table scan
+- Alternative: Index on of alone would help (filters first)
+
+* Index Effectiveness Analysis
+
+** Current Index Usage
+
+*** fact_since Index
+#+BEGIN_SRC sql
+CREATE INDEX fact_since ON fact (since);
+#+END_SRC
+
+*Purpose*: Time-based queries (e.g., =WHERE since > :timestamp=)
+
+*Usage Analysis*:
+- Used in EXPORT query ORDER BY clause (after memory-driven scan)
+- Useful for incremental sync (get facts since last sync)
+- *Not sufficient for CAUSE_CHAIN query*
+
+*Effectiveness*: ✅ Good for intended purpose, but doesn't solve all problems
+
+*** memory Indexes
+#+BEGIN_SRC sql
+CREATE INDEX memory_the ON memory (the);
+CREATE INDEX memory_of ON memory (of);
+#+END_SRC
+
+*Purpose*: Filter by entity type (the) or entity ID (of)
+
+*Effectiveness*: ✅ *EXCELLENT*
+- Primary key (the, of) ensures unique current state
+- Indexes support filtering on either column
+- Core queries (EXPORT) driven by this table
+
+** Missing Indexes - Impact Analysis
+
+*** Missing: Composite Index on fact(of, the)
+
+*Impact*: ❌ *CRITICAL*
+
+This index would optimize:
+- CAUSE_CHAIN anchor query (currently full scan)
+- Historical lookups by entity
+
+*Query it would accelerate*:
+#+BEGIN_SRC sql
+SELECT cause, this FROM fact 
+WHERE fact.of = :of AND fact.the = :the
+#+END_SRC
+
+*Performance improvement*:
+- Current: O(N) full table scan
+- With index: O(log N + M) where M = matching rows
+- Typical M = 1-20 (one entity's history)
+
+*Cost-benefit*:
+- Disk space: ~10-20% of fact table size
+- Insert performance: ~5-10% slower (maintain index)
+- Query speedup: 10-1000x faster (for large tables)
+
+Recommendation: *ADD THIS INDEX*
+
+*** Missing: Index on fact.the
+
+*Impact*: ⚠️ *MODERATE*
+
+Would optimize:
+- Queries filtering by type across all entities
+- Scanning all facts of a given MIME type
+
+*Example query*:
+#+BEGIN_SRC sql
+SELECT * FROM fact WHERE the = 'application/json';
+#+END_SRC
+
+*Current usage*: Rare (most queries go through memory table)
+
+Recommendation: *DEFER* unless historical type-based queries become common
+
+*** Missing: Index on fact.of
+
+*Impact*: ⚠️ *MODERATE*
+
+Would optimize:
+- Historical queries for single entity
+- Standalone alternative to composite (of, the) index
+
+*Performance*:
+- Better than no index (filters to one entity)
+- Worse than composite index (still needs to scan entity's rows)
+
+Recommendation: *Use composite (of, the) instead*
+
+** Optimal Index Strategy
+
+*** Recommended Indexes
+
+1. *Keep existing*:
+   - =fact(since)= - for temporal queries ✅
+   - =memory(the)=, =memory(of)= - for current state ✅
+
+2. *ADD IMMEDIATELY*:
+   - =fact(of, the)= - *CRITICAL* for CAUSE_CHAIN performance
+
+3. *Consider for future*:
+   - =fact(the)= - if historical type queries become common
+   - =fact(cause)= - if backward traversal queries needed
+
+*** Index Size Estimates
+
+Assuming 1M fact rows, average 50 bytes per entry:
+
+| Index           | Approx Size | Purpose                   | Priority |
+|-----------------+-------------+---------------------------+----------|
+| fact(since)     | 20 MB       | Time queries ✅           | Keep     |
+| fact(of, the)   | 40 MB       | Entity history ❌         | ADD      |
+| memory(the, of) | 1 MB        | Current state ✅          | Keep     |
+| *Total*         | ~60 MB      | For 1M historical facts   |          |
+
+* Mitigation Strategies
+
+** Immediate Actions (High Priority)
+
+*** 1. Add Composite Index on fact(of, the)
+
+*Implementation*:
+#+BEGIN_SRC sql
+CREATE INDEX IF NOT EXISTS fact_of_the ON fact (of, the);
+#+END_SRC
+
+*Impact*:
+- Fixes CAUSE_CHAIN full table scan
+- Enables efficient entity history queries
+- ~10-20% storage overhead
+- One-time index build cost (may take minutes for large tables)
+
+*Migration Strategy*:
+- Add to PREPARE statement (space.ts:90)
+- Create migration script in packages/memory/migrations/
+- Background build for existing databases
+
+*** 2. Re-enable CAUSE_CHAIN with Safeguards
+
+Currently disabled (space.ts:759-760):
+#+BEGIN_SRC typescript
+// Disable including history tracking for performance.
+// Re-enable this if you need to debug cause chains.
+const revisions: Revision<Fact>[] = [];
+#+END_SRC
+
+*After adding index*:
+- Re-enable for better error messages
+- Add max depth limit (prevent runaway recursion)
+- Add query timeout (detect performance issues)
+
+** Medium-term Optimizations
+
+*** 3. Implement Fact Table Partitioning
+
+*Concept*: Separate hot (recent) and cold (old) data
+
+*Approach*:
+#+BEGIN_SRC sql
+-- Recent facts (last 30 days)
+CREATE TABLE fact_hot AS 
+  SELECT * FROM fact WHERE since > (current_timestamp - 30);
+
+-- Archived facts (older than 30 days)  
+CREATE TABLE fact_archive AS
+  SELECT * FROM fact WHERE since <= (current_timestamp - 30);
+
+-- Union view for queries
+CREATE VIEW fact AS
+  SELECT * FROM fact_hot
+  UNION ALL
+  SELECT * FROM fact_archive;
+#+END_SRC
+
+*Benefits*:
+- Hot table stays small (fast scans if needed)
+- Cold table can be compressed/archived
+- Most queries only touch hot table
+
+*Tradeoffs*:
+- Complex to implement correctly
+- Maintenance overhead (periodic archiving job)
+- Union views add query complexity
+
+*Recommendation*: Only if fact table exceeds 10M rows
+
+*** 4. Implement Fact Compaction
+
+*Concept*: Compress long cause chains
+
+For entity with 100 updates:
+- Current: 100 fact rows forming chain
+- Compacted: 1 "checkpoint" fact + recent facts
+
+*Algorithm*:
+1. Periodically identify long cause chains (>50 facts)
+2. Create synthetic "checkpoint" fact capturing current state
+3. Mark old facts as archived (or move to separate table)
+4. Update cause references to checkpoint
+
+*Benefits*:
+- Reduces CAUSE_CHAIN traversal depth
+- Maintains correctness (checkpoint is valid fact)
+- Can archive ancient history
+
+*Tradeoffs*:
+- Loses granular history for old changes
+- Complex to implement correctly
+- May break causality assumptions in edge cases
+
+*Recommendation*: Consider for systems with very long-lived entities
+
+** Long-term Architectural Changes
+
+*** 5. Implement Time-based Retention Policy
+
+*Concept*: Delete facts older than N days/months
+
+#+BEGIN_SRC sql
+-- Delete facts older than 1 year
+DELETE FROM fact 
+WHERE since < (SELECT MAX(since) FROM fact) - (365 * 86400);
+#+END_SRC
+
+*Benefits*:
+- Caps fact table growth
+- Simple to implement
+- Clear user expectation ("1 year history")
+
+*Tradeoffs*:
+- ⚠️ *Violates append-only guarantee*
+- May break causality for old entities
+- Requires careful handling of cause references
+
+*Recommendation*: Only for applications with clear retention requirements
+
+*** 6. Move to Distributed Event Store
+
+For massive scale (>100M facts):
+- Replace SQLite with dedicated event store (EventStore, Kafka)
+- Separate write path (fact log) from read path (materialized views)
+- Implement proper partitioning and sharding
+
+*Recommendation*: Only at extreme scale (not needed for typical use)
+
+* Long-term Scaling Concerns
+
+** Growth Scenarios
+
+*** Small-scale (< 100K facts)
+- *Timeline*: 100 users × 100 operations/user/month = 10K facts/month
+- *Projection*: ~10 months to 100K facts
+- *Performance*: Excellent (even without optimizations)
+- *Action*: No changes needed
+
+*** Medium-scale (100K - 10M facts)
+- *Timeline*: 1000 active documents × 100 edits/day = 100K facts/day
+- *Projection*: 100 days to 10M facts
+- *Performance*: 
+  - Current-state queries: Still excellent ✅
+  - CAUSE_CHAIN: Becoming slow ❌
+- *Action*: *Add fact(of, the) index immediately*
+
+*** Large-scale (10M - 100M facts)
+- *Timeline*: Real-time collaboration with 10K active users
+- *Projection*: Months to 100M facts
+- *Performance*:
+  - Current-state queries: Good (memory table independent of history)
+  - Historical queries: Slow even with indexes
+  - Database size: 5-10 GB
+- *Action*: Consider partitioning, compaction, retention policies
+
+*** Extreme-scale (> 100M facts)
+- *Timeline*: Large enterprise deployment
+- *Projection*: Continuous growth
+- *Performance*: SQLite limitations become apparent
+- *Action*: Consider distributed architecture
+
+** Bottleneck Analysis
+
+*** What breaks first?
+
+1. *CAUSE_CHAIN queries* (already disabled for performance)
+   - Broken at: ~1M facts without index
+   - Fixed by: Adding fact(of, the) index
+   - Still slow at: ~100M facts (even with index)
+
+2. *Database file size*
+   - Issue at: ~5-10 GB (SQLite still works, but slower)
+   - Platform limit: SQLite handles TB-scale, but not optimal
+
+3. *Write throughput*
+   - SQLite write limit: ~1000 writes/second
+   - Becomes issue: High-frequency collaboration (>100 concurrent users)
+
+4. *Memory table* (unlikely bottleneck)
+   - Scales with current entities, not history
+   - Only issue if >1M concurrent entities
+
+** Monitoring Recommendations
+
+*** Key Metrics to Track
+
+1. *Fact table size*
+   #+BEGIN_SRC sql
+   SELECT COUNT(*) as fact_count, 
+          MAX(since) - MIN(since) as time_span
+   FROM fact;
+   #+END_SRC
+
+2. *Memory table size* (should be roughly constant)
+   #+BEGIN_SRC sql
+   SELECT COUNT(*) as current_entities FROM memory;
+   #+END_SRC
+
+3. *Growth rate*
+   #+BEGIN_SRC sql
+   SELECT COUNT(*) as facts_per_day
+   FROM fact
+   WHERE since > (SELECT MAX(since) FROM fact) - 86400;
+   #+END_SRC
+
+4. *Average cause chain depth*
+   #+BEGIN_SRC sql
+   -- Requires traversing chains (expensive)
+   -- Run periodically on sample
+   #+END_SRC
+
+5. *Query performance*
+   - Monitor p95/p99 latency for EXPORT, CAUSE_CHAIN
+   - Alert if degradation over time
+
+*** Warning Thresholds
+
+| Metric              | Warning        | Critical        | Action              |
+|---------------------+----------------+-----------------+---------------------|
+| Fact table rows     | 1M             | 10M             | Add indexes         |
+| Database file size  | 1 GB           | 5 GB            | Consider archiving  |
+| CAUSE_CHAIN latency | 100ms          | 1s              | Add (of, the) index |
+| Growth rate         | 100K facts/day | 1M facts/day    | Plan partitioning   |
+
+** Design Tradeoffs
+
+The current design makes a deliberate tradeoff:
+
+*Optimized for*:
+- Current state queries (via memory table) ✅
+- Write performance (append-only) ✅
+- Causality tracking (full history) ✅
+
+*Sacrifices*:
+- Historical query performance ⚠️
+- Storage efficiency (no compaction) ⚠️
+- Bounded growth (unlimited retention) ⚠️
+
+This is a *correct tradeoff* for the system's primary use case (collaborative
+document editing with current-state focus). Historical queries are rare.
+
+* Recommendations Summary
+
+** Critical (Do Now)
+
+1. ✅ *ADD INDEX*: =CREATE INDEX fact_of_the ON fact (of, the)=
+   - Fixes CAUSE_CHAIN performance
+   - Enables efficient historical queries
+   - ~10-20% storage overhead
+
+2. ✅ *RE-ENABLE CAUSE_CHAIN* with safeguards:
+   - Max depth limit (prevent runaway)
+   - Query timeout (detect issues)
+   - Better error messages for conflicts
+
+## High Priority (Next Sprint)
+
+3. ✅ *MONITORING*: Implement fact table size tracking
+   - Track growth rate over time
+   - Alert on unusual patterns
+   - Dashboard with key metrics
+
+4. ✅ *DOCUMENTATION*: Document scaling expectations
+   - Expected fact growth per user
+   - Performance characteristics
+   - When to consider archiving
+
+** Medium Priority (Next Quarter)
+
+5. ⚠️ *PARTITIONING PLAN*: Design hot/cold data separation
+   - Identify optimal time threshold (30 days?)
+   - Prototype implementation
+   - Plan migration strategy
+
+6. ⚠️ *COMPACTION STUDY*: Research fact compaction approaches
+   - Survey similar systems (Git, Event Sourcing)
+   - Prototype checkpoint algorithm
+   - Evaluate tradeoffs
+
+** Low Priority (Future)
+
+7. 🔮 *RETENTION POLICY*: If needed, implement data lifecycle
+   - Define retention requirements
+   - Design safe deletion mechanism
+   - Implement background cleanup job
+
+8. 🔮 *DISTRIBUTED ARCHITECTURE*: At extreme scale only
+   - Evaluate event store solutions
+   - Design migration path
+   - Cost-benefit analysis
+
+* Conclusion
+
+The fact table's append-only growth is *by design* and generally well-managed:
+
+- ✅ Current-state queries are *excellent* (memory-table driven)
+- ✅ Write performance is *excellent* (append-only)
+- ❌ Historical queries have *one critical flaw*: missing (of, the) index
+- ⚠️ Long-term growth requires *monitoring and planning*
+
+*Primary recommendation*: Add the missing composite index immediately. This
+single change resolves the only significant performance issue identified.
+
+The architecture is sound for the intended use case (collaborative document
+editing with ~1M-10M fact history). Beyond that scale, consider
+partitioning or archiving strategies, but these are *not urgent* for
+typical deployments.

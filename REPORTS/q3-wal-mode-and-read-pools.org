@@ -1,0 +1,778 @@
+#+TITLE: Q3: WAL Mode and Read Pools in packages/memory
+#+AUTHOR: Research Investigation
+#+DATE: 2025-11-12
+
+* Executive Summary
+
+The packages/memory implementation currently serializes *all* operations (both reads and writes) through a single ~perform~ queue to work around concurrency bugs in the Deno SQLite bindings. Enabling SQLite's WAL (Write-Ahead Logging) mode combined with a read connection pool could dramatically improve read concurrency by allowing multiple simultaneous read transactions while writes proceed independently. However, this approach requires careful consideration of:
+
+1. *WAL mode limitations*: Cannot work over network filesystems, potential for unbounded WAL file growth
+2. *Implementation complexity*: Manual connection pool management (no built-in support in @db/sqlite)
+3. *Consistency guarantees*: Understanding read isolation and checkpoint behavior
+4. *Architecture changes*: Separating read and write paths to leverage concurrency benefits
+
+* Current Implementation Analysis
+
+** Serialization Queue (memory.ts:67-76)
+
+The current implementation uses a promise-based queue to serialize all operations:
+
+#+BEGIN_SRC typescript
+/**
+ * Runs task one at a time, this works around some bug in deno sqlite bindings
+ * which seems to cause problems if query and transaction happen concurrently.
+ */
+async perform<Out>(task: () => Promise<Out>): Promise<Out> {
+  return await traceAsync("memory.perform", async (_span) => {
+    const result = this.ready.finally().then(task);
+    this.ready = result.finally();
+    await this.ready;
+    return await result;
+  });
+}
+#+END_SRC
+
+*Key observations:*
+- Both ~query()~ and ~transact()~ operations go through this queue (lines 91-93)
+- This prevents *any* concurrent database access, even pure reads
+- Comment explicitly mentions "bug in deno sqlite bindings" as the reason
+- Creates a strict serialization bottleneck
+
+** Database Architecture
+
+Each "space" is a separate SQLite database file:
+
+#+BEGIN_SRC typescript
+// memory.ts:232-234
+const result = await Space.open({
+  url: new URL(`./${subject}.sqlite`, session.store),
+});
+#+END_SRC
+
+*Implications:*
+- Multiple spaces = multiple database files
+- Each space could theoretically have its own connection pool
+- Cross-space queries don't share locks (different databases)
+
+** @db/sqlite Library
+
+From ~packages/memory/deno.json~:
+- Uses ~jsr:@db/sqlite@^0.12.0~
+- FFI-based (requires --allow-ffi permission)
+- No built-in connection pooling support
+- Uses native SQLite via Deno's Foreign Function Interface
+
+* SQLite WAL Mode Deep Dive
+
+** What is WAL Mode?
+
+Write-Ahead Logging (WAL) is an alternative journaling method introduced in SQLite 3.7.0. Instead of modifying the database file directly and keeping a rollback journal, WAL:
+
+1. *Preserves* the original database file unchanged
+2. *Appends* all changes to a separate ~.db-wal~ file
+3. *Periodically checkpoints* the WAL contents back into the main database
+4. *Maintains* a shared memory file (~.db-shm~) for coordination
+
+** How Concurrent Access Works
+
+#+BEGIN_EXAMPLE
+┌─────────────┐
+│  Writer     │────► Appends to .db-wal file
+└─────────────┘
+                    ┌─────────────┐
+                    │  .db-wal    │
+                    └─────────────┘
+                           │
+                           │ Checkpoint (periodic)
+                           ▼
+┌─────────────┐     ┌─────────────┐
+│  Reader 1   │────►│             │
+└─────────────┘     │  .db file   │
+┌─────────────┐     │  (main)     │
+│  Reader 2   │────►│             │
+└─────────────┘     └─────────────┘
+                           ▲
+                           │
+                    ┌─────────────┐
+                    │  .db-shm    │
+                    │ (shared mem)│
+                    └─────────────┘
+#+END_EXAMPLE
+
+*Key mechanisms:*
+- *Writers* append sequentially to the WAL file
+- *Readers* check WAL for needed pages before accessing main database
+- *No blocking*: Readers and writers proceed concurrently
+- *Checkpoints* transfer WAL contents to main database during quiet periods
+
+** Benefits for Concurrency
+
+1. *Multiple concurrent readers*: Any number of read transactions can execute simultaneously
+2. *Reads don't block writes*: Writers append to WAL while readers access committed data
+3. *Writes don't block reads*: New writes don't prevent readers from accessing previous commits
+4. *Better throughput*: Eliminates read-write contention that plagues rollback journal mode
+
+** Drawbacks and Limitations
+
+*** Network Filesystem Incompatibility
+
+#+BEGIN_QUOTE
+"All processes using a database must be on the same host computer; 
+WAL does not work over a network filesystem"
+#+END_QUOTE
+
+*Impact for packages/memory:*
+- ✅ Not a concern for local development
+- ✅ Not a concern for single-server deployments
+- ❌ Would break network-mounted storage scenarios
+- ❌ Cannot share database across multiple machines
+
+*** Large Transaction Performance
+
+WAL mode does not handle very large transactions efficiently:
+- Large transactions can cause the WAL file to grow significantly
+- Checkpoint operations may take longer
+- May need manual checkpoint management for bulk operations
+
+*** Additional Files Complexity
+
+Three files per database instead of one:
+- ~space.sqlite~ - Main database file
+- ~space.sqlite-wal~ - Write-ahead log
+- ~space.sqlite-shm~ - Shared memory coordination
+
+*Implications:*
+- Backup procedures must capture all three files atomically
+- File distribution becomes more complex
+- Cleanup requires removing all three files
+
+*** Read-Only Access Complications
+
+Earlier SQLite versions couldn't open WAL databases in read-only mode. Modern versions (3.22.0+) support this, but:
+- Requires the ~.db-shm~ file to be writable
+- Read-only processes cannot checkpoint
+
+*** WAL File Growth Risk
+
+*Critical issue:* If there are always overlapping readers, no checkpoints can complete:
+
+#+BEGIN_EXAMPLE
+Time:  T0    T1    T2    T3    T4    T5
+       │     │     │     │     │     │
+R1:    ├─────────────────────────┤
+R2:         ├─────────────────────────┤
+R3:               ├─────────────────────────┤
+R4:                     ├─────────────────────────┤
+       │     │     │     │     │     │     │
+WAL:   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ►
+       grows continuously, never checkpointed!
+#+END_EXAMPLE
+
+*Mitigation strategies:*
+- Ensure "reader gaps" - periods with zero active readers
+- Set connection timeouts for read transactions
+- Manual checkpoint triggers during low-traffic periods
+- Monitor WAL file size
+
+* Read Connection Pools
+
+** Concept
+
+A read pool maintains multiple open database connections for read-only operations:
+
+#+BEGIN_EXAMPLE
+                    ┌──────────────────┐
+                    │  Read Pool       │
+                    │  ┌────┐ ┌────┐  │
+Query 1 ───────────►│  │ R1 │ │ R2 │  │────► SQLite DB
+Query 2 ───────────►│  └────┘ └────┘  │      (WAL mode)
+Query 3 ───────────►│  ┌────┐ ┌────┐  │
+                    │  │ R3 │ │ R4 │  │
+                    │  └────┘ └────┘  │
+                    └──────────────────┘
+                              │
+Write ─────────────────────────┘
+                     (single connection)
+#+END_EXAMPLE
+
+** Interaction with WAL Mode
+
+In WAL mode, a read pool provides:
+
+1. *True parallelism*: Each connection can execute SELECT queries simultaneously
+2. *No lock contention*: Readers don't acquire exclusive locks
+3. *Snapshot isolation*: Each read transaction sees a consistent snapshot
+4. *Independent progress*: One slow query doesn't block others
+
+** Implementation Considerations for @db/sqlite
+
+Since @db/sqlite has *no built-in pooling*, implementation would require:
+
+#+BEGIN_SRC typescript
+interface ReadPool {
+  connections: Database[];
+  available: Database[];
+  inUse: Set<Database>;
+  maxSize: number;
+}
+
+async function acquireReader(pool: ReadPool): Promise<Database> {
+  // Wait for available connection or create new one
+  while (pool.available.length === 0 && pool.connections.length >= pool.maxSize) {
+    await sleep(10); // Or use proper queue
+  }
+  
+  if (pool.available.length > 0) {
+    const conn = pool.available.pop()!;
+    pool.inUse.add(conn);
+    return conn;
+  }
+  
+  // Create new connection
+  const conn = await new Database(url, { create: false });
+  conn.exec("PRAGMA journal_mode=WAL");
+  conn.exec("PRAGMA query_only=1"); // Read-only mode
+  pool.connections.push(conn);
+  pool.inUse.add(conn);
+  return conn;
+}
+
+function releaseReader(pool: ReadPool, conn: Database) {
+  pool.inUse.delete(conn);
+  pool.available.push(conn);
+}
+#+END_SRC
+
+* Proper Concurrent Reader/Writer Handling in SQLite
+
+** Best Practices
+
+1. *Separate read and write paths*:
+   #+BEGIN_SRC typescript
+   class Memory {
+     writeConnection: Database;  // Single writer
+     readPool: ReadPool;         // Multiple readers
+     
+     async query(q: Query) {
+       const conn = await this.readPool.acquire();
+       try {
+         return executeQuery(conn, q);
+       } finally {
+         this.readPool.release(conn);
+       }
+     }
+     
+     async transact(t: Transaction) {
+       // Always use the single write connection
+       return executeTransaction(this.writeConnection, t);
+     }
+   }
+   #+END_SRC
+
+2. *Configure WAL mode optimally*:
+   #+BEGIN_SRC sql
+   PRAGMA journal_mode=WAL;           -- Enable WAL
+   PRAGMA synchronous=NORMAL;         -- Faster, still safe in WAL
+   PRAGMA wal_autocheckpoint=1000;    -- Checkpoint every 1000 pages
+   PRAGMA temp_store=MEMORY;          -- Use memory for temp tables
+   PRAGMA mmap_size=30000000000;      -- Memory-mapped I/O (30GB)
+   #+END_SRC
+
+3. *Manage transaction duration*:
+   - Keep read transactions short
+   - Use statement-level reads when possible
+   - Avoid long-lived prepared statements
+
+4. *Monitor and maintain*:
+   - Track WAL file size
+   - Force checkpoints during quiet periods
+   - Log slow queries
+
+** Consistency Guarantees
+
+WAL mode provides:
+- *Atomic transactions*: All-or-nothing commit guarantee
+- *Consistent reads*: Each reader sees a consistent snapshot
+- *Isolated transactions*: Readers see committed data only
+- *Durable writes*: After checkpoint, data is persisted
+
+*Important:* Readers may see slightly stale data (from before the most recent write) if they start a transaction before a checkpoint occurs. This is usually acceptable for most applications.
+
+* Usage Pattern Analysis
+
+** Test Suite Observations
+
+From analyzing ~packages/memory/test/*.ts~:
+
+1. *Query frequency*: 182 total occurrences of ~.query()~ and ~.transact()~ across test files
+2. *Common patterns*:
+   - Create fact → Query to verify
+   - Batch updates with multiple facts
+   - Subscription-based change watching
+   - Schema-based graph traversal queries
+
+3. *Stress test* (test/stress-debug.ts):
+   - Creates 2000 fact assertions in a single transaction
+   - Measures transaction time
+   - Shows bulk write pattern
+
+** Provider Bypass Case
+
+Notably, ~provider.ts:504~ bypasses the ~perform~ queue:
+
+#+BEGIN_SRC typescript
+// We need to bypass the perform queue to avoid a deadlock
+const result = await Memory.querySchema(
+  this.memory as Memory.Memory,
+  newInvocation,
+);
+#+END_SRC
+
+*This reveals:*
+- The serialization queue creates architectural constraints
+- Deadlock potential exists in subscription re-query scenarios
+- Direct memory access is sometimes necessary
+
+** Read/Write Ratio Estimation
+
+Based on test patterns:
+- *Reads*: ~60-70% of operations (queries, subscriptions)
+- *Writes*: ~30-40% of operations (transactions)
+
+This ratio strongly favors read optimization strategies.
+
+* Performance Implications
+
+** Current Bottleneck
+
+With serialized operations:
+- All operations wait in queue
+- Read latency = write latency + queue time
+- No parallelism benefit from multiple CPU cores
+- Throughput limited to ~1 / (avg_operation_time)
+
+** With WAL + Read Pool
+
+Potential improvements:
+- *Read throughput*: Scales with number of pooled connections
+- *Read latency*: Reduced queue waiting (only waits for available connection)
+- *Write latency*: Unaffected (still single writer)
+- *Overall throughput*: Significantly higher for read-heavy workloads
+
+*** Estimated Gains (Hypothetical)
+
+Assuming:
+- 4 read connections in pool
+- 70% read / 30% write workload
+- Current avg operation: 10ms
+
+*Before:*
+- Throughput: ~100 ops/sec
+- Read latency: 10ms + queue wait
+
+*After (WAL + pool):*
+- Read throughput: ~400 reads/sec (4x parallel)
+- Mixed throughput: ~350-400 ops/sec (3.5-4x improvement)
+- Read latency: 10ms (no queue wait if connection available)
+
+** Memory Overhead
+
+Each additional connection costs:
+- ~1-2MB per connection (SQLite overhead)
+- Page cache memory (configurable via ~PRAGMA cache_size~)
+- OS file descriptor
+
+For a 4-connection pool: ~8-10MB additional memory
+
+* Implementation Recommendations
+
+** Phase 1: Enable WAL Mode (Low Risk)
+
+#+BEGIN_SRC typescript
+// space.ts, in open() function after database creation
+export const open = async <Subject extends MemorySpace>({
+  url,
+}: Options): AsyncResult<Space<Subject>, ConnectionError> => {
+  return await traceAsync("space.open", async (span) => {
+    // ... existing code ...
+    
+    database = await new Database(address ?? ":memory:", {
+      create: true,
+    });
+    
+    // Enable WAL mode with optimized settings
+    if (address !== null) { // Don't set WAL for :memory: databases
+      database.exec(`
+        PRAGMA journal_mode=WAL;
+        PRAGMA synchronous=NORMAL;
+        PRAGMA temp_store=MEMORY;
+        PRAGMA mmap_size=30000000000;
+      `);
+    }
+    
+    database.exec(PREPARE);
+    // ... rest of function ...
+  });
+};
+#+END_SRC
+
+*Benefits:*
+- Prepares infrastructure for concurrency
+- May improve single-connection performance
+- Low implementation risk
+
+*Testing:*
+- Run full test suite
+- Verify WAL files created correctly
+- Monitor file cleanup on close
+
+** Phase 2: Implement Read Pool (Medium Risk)
+
+Create new ~packages/memory/pool.ts~:
+
+#+BEGIN_SRC typescript
+import { Database } from "@db/sqlite";
+
+export interface PoolOptions {
+  url: URL | null;
+  minSize: number;
+  maxSize: number;
+}
+
+export class ConnectionPool {
+  private connections: Database[] = [];
+  private available: Database[] = [];
+  private inUse = new Set<Database>();
+  private waiters: Array<(conn: Database) => void> = [];
+  
+  constructor(private options: PoolOptions) {}
+  
+  async initialize() {
+    // Create minimum number of connections
+    for (let i = 0; i < this.options.minSize; i++) {
+      await this.createConnection();
+    }
+  }
+  
+  private async createConnection(): Promise<Database> {
+    const conn = await new Database(this.options.url ?? ":memory:", {
+      create: false,
+    });
+    
+    if (this.options.url !== null) {
+      conn.exec("PRAGMA journal_mode=WAL");
+      conn.exec("PRAGMA query_only=1");
+    }
+    
+    this.connections.push(conn);
+    this.available.push(conn);
+    return conn;
+  }
+  
+  async acquire(): Promise<Database> {
+    // If connection available, return immediately
+    if (this.available.length > 0) {
+      const conn = this.available.pop()!;
+      this.inUse.add(conn);
+      return conn;
+    }
+    
+    // If can create more, do so
+    if (this.connections.length < this.options.maxSize) {
+      const conn = await this.createConnection();
+      this.available.pop(); // Remove from available
+      this.inUse.add(conn);
+      return conn;
+    }
+    
+    // Wait for a connection to become available
+    return new Promise((resolve) => {
+      this.waiters.push(resolve);
+    });
+  }
+  
+  release(conn: Database) {
+    this.inUse.delete(conn);
+    
+    if (this.waiters.length > 0) {
+      const waiter = this.waiters.shift()!;
+      this.inUse.add(conn);
+      waiter(conn);
+    } else {
+      this.available.push(conn);
+    }
+  }
+  
+  async close() {
+    for (const conn of this.connections) {
+      conn.close();
+    }
+    this.connections = [];
+    this.available = [];
+    this.inUse.clear();
+  }
+}
+#+END_SRC
+
+** Phase 3: Refactor Memory Class (High Risk)
+
+Modify ~packages/memory/memory.ts~:
+
+#+BEGIN_SRC typescript
+import { ConnectionPool } from "./pool.ts";
+
+export class Memory implements Session, MemorySession {
+  store: URL;
+  ready: Promise<unknown>;
+  #serviceDid: DID;
+  #readPool?: ConnectionPool;
+  
+  constructor(options: Options, ...) {
+    // ... existing code ...
+    
+    // Initialize read pool for file-based databases
+    if (options.store.protocol === "file:") {
+      this.#readPool = new ConnectionPool({
+        url: options.store,
+        minSize: 2,
+        maxSize: 4,
+      });
+    }
+  }
+  
+  // Remove perform() for queries, keep only for writes
+  async performWrite<Out>(task: () => Promise<Out>): Promise<Out> {
+    return await traceAsync("memory.performWrite", async (_span) => {
+      const result = this.ready.finally().then(task);
+      this.ready = result.finally();
+      await this.ready;
+      return await result;
+    });
+  }
+  
+  transact(transaction: Transaction): TransactionResult {
+    // Writes still serialized
+    return this.performWrite(() => transact(this, transaction));
+  }
+  
+  query(source: Query): QueryResult {
+    // Reads use pool if available, otherwise direct
+    if (this.#readPool) {
+      return queryWithPool(this, this.#readPool, source);
+    }
+    return query(this, source);
+  }
+}
+
+async function queryWithPool(
+  session: Session,
+  pool: ConnectionPool,
+  query: Query
+): Promise<QueryResult> {
+  const conn = await pool.acquire();
+  try {
+    // Execute query using pooled connection
+    return await executeQueryDirect(conn, session, query);
+  } finally {
+    pool.release(conn);
+  }
+}
+#+END_SRC
+
+** Phase 4: Monitor and Tune
+
+Implement monitoring:
+
+#+BEGIN_SRC typescript
+interface PoolMetrics {
+  activeConnections: number;
+  availableConnections: number;
+  waitingQueries: number;
+  walFileSize: number;
+  checkpointCount: number;
+}
+
+// Add to ConnectionPool class
+getMetrics(): PoolMetrics {
+  return {
+    activeConnections: this.inUse.size,
+    availableConnections: this.available.length,
+    waitingQueries: this.waiters.length,
+    // ... collect WAL metrics via PRAGMA statements
+  };
+}
+#+END_SRC
+
+* Risks and Mitigations
+
+** Risk 1: Deno SQLite Bug Still Exists
+
+*Risk:* The original concurrency bug may still affect pooled connections
+
+*Mitigation:*
+- Incremental rollout with feature flag
+- Extensive testing under concurrent load
+- Fallback to serialized mode if issues detected
+
+** Risk 2: WAL File Growth
+
+*Risk:* Continuous read load prevents checkpointing
+
+*Mitigation:*
+- Monitor WAL file size metrics
+- Implement periodic forced checkpoints during low-traffic periods
+- Set connection timeouts for long-running read transactions
+
+** Risk 3: Connection Pool Exhaustion
+
+*Risk:* All connections in use, queries wait indefinitely
+
+*Mitigation:*
+- Implement acquire timeout
+- Queue depth limits
+- Graceful degradation to shared connection
+
+** Risk 4: Shared Memory Issues
+
+*Risk:* The ~.db-shm~ file may cause permission or cleanup issues
+
+*Mitigation:*
+- Ensure proper file permissions
+- Clean up all WAL-related files on close
+- Document deployment considerations
+
+* Testing Strategy
+
+** Unit Tests
+
+1. Verify WAL mode enabled:
+   #+BEGIN_SRC typescript
+   Deno.test("WAL mode is enabled", async () => {
+     const db = await Space.open({ url: testDbUrl });
+     const result = db.store.prepare("PRAGMA journal_mode").get();
+     assertEquals(result.journal_mode, "wal");
+   });
+   #+END_SRC
+
+2. Test read pool acquire/release:
+   #+BEGIN_SRC typescript
+   Deno.test("Connection pool lifecycle", async () => {
+     const pool = new ConnectionPool({ url, minSize: 2, maxSize: 4 });
+     await pool.initialize();
+     
+     const conn1 = await pool.acquire();
+     const conn2 = await pool.acquire();
+     assertEquals(pool.getMetrics().activeConnections, 2);
+     
+     pool.release(conn1);
+     assertEquals(pool.getMetrics().availableConnections, 1);
+     
+     await pool.close();
+   });
+   #+END_SRC
+
+** Integration Tests
+
+1. Concurrent read test:
+   #+BEGIN_SRC typescript
+   Deno.test("Concurrent queries complete successfully", async () => {
+     const memory = await Memory.open({ store: testUrl });
+     
+     // Create test data
+     await memory.transact(createTestTransaction);
+     
+     // Execute 10 concurrent queries
+     const queries = Array.from({ length: 10 }, () => 
+       memory.query(testQuery)
+     );
+     
+     const results = await Promise.all(queries);
+     
+     results.forEach(r => assert(r.ok));
+     await memory.close();
+   });
+   #+END_SRC
+
+2. Read-while-write test:
+   #+BEGIN_SRC typescript
+   Deno.test("Reads proceed during writes", async () => {
+     const memory = await Memory.open({ store: testUrl });
+     
+     // Start long-running write
+     const writePromise = memory.transact(largeTransaction);
+     
+     // Execute read while write in progress
+     const readPromise = memory.query(testQuery);
+     
+     const [writeResult, readResult] = await Promise.all([
+       writePromise,
+       readPromise
+     ]);
+     
+     assert(writeResult.ok);
+     assert(readResult.ok);
+   });
+   #+END_SRC
+
+** Stress Tests
+
+Update ~test/stress-debug.ts~ to test concurrent load:
+
+#+BEGIN_SRC typescript
+const concurrentTest = async () => {
+  const provider = await Provider.open({ store: url, serviceDid });
+  const consumer = Consumer.open({ as: alice, session: provider.session() });
+  const home = consumer.mount(space.did());
+  
+  // Mix of reads and writes
+  const operations = [];
+  
+  // 1000 concurrent reads
+  for (let i = 0; i < 1000; i++) {
+    operations.push(home.query({ select: { _: {} } }));
+  }
+  
+  // 100 concurrent writes
+  for (let i = 0; i < 100; i++) {
+    operations.push(home.transact({ changes: generateChanges(10) }));
+  }
+  
+  const start = Date.now();
+  const results = await Promise.all(operations);
+  const duration = Date.now() - start;
+  
+  console.log(`Completed ${operations.length} operations in ${duration}ms`);
+  console.log(`Throughput: ${(operations.length / duration * 1000).toFixed(2)} ops/sec`);
+  
+  const errors = results.filter(r => r.error);
+  console.log(`Errors: ${errors.length}`);
+};
+#+END_SRC
+
+* Conclusion
+
+Enabling WAL mode and implementing a read connection pool represents a significant architectural improvement for packages/memory. The benefits include:
+
+✅ *Dramatic read concurrency improvements* (potentially 3-4x throughput)
+✅ *Lower read latency* (elimination of write-induced blocking)
+✅ *Better resource utilization* (parallel query execution)
+✅ *Architectural cleanliness* (separation of read and write paths)
+
+However, this requires:
+
+⚠️ Careful implementation of connection pooling (no built-in support)
+⚠️ Monitoring and management of WAL file growth
+⚠️ Thorough testing under concurrent load
+⚠️ Documentation of deployment considerations
+
+*Recommended approach:* Phased rollout starting with WAL enablement, followed by read pool implementation with extensive testing at each stage.
+
+* References
+
+- SQLite Write-Ahead Logging: https://sqlite.org/wal.html
+- @db/sqlite on JSR: https://jsr.io/@db/sqlite
+- Managing Concurrent Access in SQLite Databases: https://www.slingacademy.com/article/managing-concurrent-access-in-sqlite-databases/
+- SQLite Performance Tuning: https://phiresky.github.io/blog/2020/sqlite-performance-tuning/
+- packages/memory/memory.ts:67-76 (perform queue implementation)
+- packages/memory/space.ts:332-370 (database connection handling)
+- packages/memory/provider.ts:504 (bypass example revealing architectural constraint)
