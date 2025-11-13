@@ -1,0 +1,485 @@
+#+TITLE: The Deadlock in provider.ts:504 - Deep Dive Analysis
+#+AUTHOR: Claude Code Investigation
+#+DATE: 2025-11-12
+#+OPTIONS: toc:2 num:t
+
+* Executive Summary
+
+The code at [[file:../packages/memory/provider.ts::504][provider.ts:504]] bypasses the =perform()= serialization queue to avoid a **genuine deadlock** that occurs when subscriber notifications try to query the database while a transaction is still holding the queue lock.
+
+This is a **design flaw** in the architecture where synchronous subscriber notifications create a circular dependency with the queue-based serialization mechanism.
+
+* The Deadlock Call Stack
+
+** Step-by-Step Flow
+
+#+begin_example
+1. User → memory.transact(transaction)
+   ↓
+2. Goes through perform() QUEUE [LOCK ACQUIRED]
+   ↓
+3. Executes: space.transact(transaction)
+   ↓
+4. Transaction succeeds, returns commit
+   ↓
+5. Notify subscribers: for (subscriber of subscribers)
+   ↓
+6. Calls: subscriber.commit(result.ok) [WAITING FOR COMPLETION]
+   ↓
+7. provider.commit() runs
+   ↓
+8. Calls: getSchemaSubscriptionMatches()
+   ↓
+9. Wants to run: memory.querySchema() ← DEADLOCK!
+#+end_example
+
+* Why It Deadlocks
+
+** The Circular Dependency
+
+The problem occurs because:
+
+1. *Step 2*: =perform()= queue has a LOCK (waits for current task to finish)
+2. *Step 6*: Current task is WAITING for =subscriber.commit()= to complete
+3. *Step 9*: =subscriber.commit()= wants to call =memory.querySchema()=
+4. But =memory.querySchema()= goes through =perform()= queue (memory.ts:95-96)
+5. =perform()= queue is BLOCKED waiting for step 2's task to finish
+6. Step 2's task is WAITING for step 6 to finish
+7. Step 6 is WAITING for step 9 to finish
+8. Step 9 is WAITING for the perform() queue
+9. **CIRCULAR DEPENDENCY = DEADLOCK**
+
+** Visual Representation
+
+#+begin_example
+perform() queue (locked)
+    ↓ holds lock
+transact() task
+    ↓ calls
+subscriber.commit()
+    ↓ needs
+querySchema()
+    ↓ needs
+perform() queue ← DEADLOCK! Already locked by transact()
+#+end_example
+
+* The Code That Causes the Deadlock
+
+** File: [[file:../packages/memory/memory.ts::87][memory.ts:87-96]]
+
+#+begin_src typescript
+transact(transaction: Transaction): TransactionResult {
+  return this.perform(() => transact(this, transaction));
+}
+
+query(source: Query): QueryResult {
+  return this.perform(() => query(this, source));
+}
+
+querySchema(source: SchemaQuery): QueryResult {
+  return this.perform(() => querySchema(this, source));
+  // ↑ All operations go through the queue
+}
+#+end_src
+
+** File: [[file:../packages/memory/memory.ts::170][memory.ts:170-212]] - Transaction with Subscriber Notification
+
+#+begin_src typescript
+export const transact = async (session: Session, transaction: Transaction) => {
+  // ... perform transaction ...
+  const result = space.transact(transaction);
+
+  if (result.error) {
+    return result;
+  } else {
+    return await traceAsync(
+      "memory.notify_subscribers",
+      async (notifySpan) => {
+        const promises = [];
+        // Copy here, in case a subscriber modifies the set of subscribers
+        for (const subscriber of [...session.subscribers]) {
+          promises.push(subscriber.commit(result.ok));  // ← BLOCKS HERE
+        }
+        await Promise.all(promises);  // ← WAITING for subscribers
+
+        return result;
+      },
+    );
+  }
+};
+#+end_src
+
+** File: [[file:../packages/memory/provider.ts::369][provider.ts:369-416]] - Subscriber That Needs to Query
+
+#+begin_src typescript
+async commit(commit: Commit<Space>) {
+  for (
+    const item of SelectionBuilder.iterate<{ is: Memory.CommitData }>(commit)
+  ) {
+    const redactedData = redactCommitData(item.value.is);
+    if (Subscription.isTransactionReadOnly(redactedData.transaction)) {
+      continue;
+    }
+    // First, check to see if any of our schema queries need to be notified
+    const [_lastId, _maxSince, facts] = await this
+      .getSchemaSubscriptionMatches(
+        redactedData.transaction,  // ← Calls method that needs to query
+      );
+    // ...
+  }
+}
+#+end_src
+
+** File: [[file:../packages/memory/provider.ts::487][provider.ts:487-539]] - The Bypass
+
+#+begin_src typescript
+private async getSchemaSubscriptionMatches<Space extends MemorySpace>(
+  transaction: Transaction<Space>,
+): Promise<[JobId | undefined, number, Revision<Fact>[]]> {
+  // ...
+  for (const [id, subscription] of this.schemaChannels) {
+    if (
+      Subscription.match(transaction, subscription.watchedObjects)
+    ) {
+      // Re-run our original query, but not as a subscription
+      const newArgs = { ...subscription.invocation.args, subscribe: false };
+      const newInvocation = { ...subscription.invocation, args: newArgs };
+
+      // We need to bypass the perform queue to avoid a deadlock
+      const result = await Memory.querySchema(
+        this.memory as Memory.Memory,  // ← Direct access, bypasses queue!
+        newInvocation,
+      );
+
+      // Instead of:
+      // const result = await this.memory.querySchema(newInvocation);
+      // Which would go through perform() and DEADLOCK
+
+      // ...
+    }
+  }
+}
+#+end_src
+
+* The Solution: Bypass the Queue
+
+** What the Code Does
+
+Line 504 calls the *module-level function* directly:
+
+#+begin_src typescript
+const result = await Memory.querySchema(
+  this.memory as Memory.Memory,  // ← Direct access to internal Memory object
+  newInvocation,
+);
+#+end_src
+
+This bypasses the queue by calling the internal =querySchema()= function directly instead of going through the =memory.querySchema()= method that wraps it in =perform()=.
+
+** Timeline Visualization
+
+#+begin_example
+TIME →
+════════════════════════════════════════════════════════════
+
+With the bypass (current implementation):
+
+perform() queue: [========== LOCKED by transact() ==========]
+                          ↓
+                    transact() running
+                          ↓
+                   [writes to SQLite]
+                          ↓
+                   [commit succeeds]
+                          ↓
+                   notify_subscribers()
+                          ↓
+                    WAITING FOR →  subscriber.commit()
+                                         ↓
+                                   getSchemaSubscriptionMatches()
+                                         ↓
+                                   Memory.querySchema() ← BYPASS!
+                                         ↓
+                                   [reads from SQLite directly]
+                                         ↓
+                                   ✅ SUCCESS!
+
+════════════════════════════════════════════════════════════
+
+Without the bypass (would deadlock):
+
+perform() queue: [========== LOCKED by transact() ==========]
+                          ↓
+                    transact() running
+                          ↓
+                   notify_subscribers()
+                          ↓
+                    WAITING FOR →  subscriber.commit()
+                                         ↓
+                                   getSchemaSubscriptionMatches()
+                                         ↓
+                                   NEEDS: memory.querySchema()
+                                         ↓
+                                   WANTS: perform() queue
+                                         ↓
+                                   ❌ BLOCKED! Queue is locked!
+                                   ❌ transact() waiting for commit()
+                                   ❌ commit() waiting for querySchema()
+                                   ❌ querySchema() waiting for perform()
+                                   ❌ perform() waiting for transact()
+                                   ❌ DEADLOCK!
+#+end_example
+
+* The Risk of This Bypass
+
+** Race Condition Potential
+
+This creates a **race condition** risk:
+
+1. The query runs OUTSIDE the serialization queue
+2. Could potentially run concurrently with another transaction
+3. This is exactly what the =perform()= queue was designed to prevent!
+
+** Why It Currently Works
+
+The bypass is (probably) safe because:
+
+1. *Read-only*: The query only reads, doesn't write
+2. *Post-commit*: The write transaction has already committed (step 4 completed)
+3. *SQLite allows concurrent reads*: Even without WAL mode, multiple readers are OK
+4. *Queue still locked*: The =perform()= queue lock is still held, so no OTHER writes can interfere
+
+** Fragile Dependencies
+
+But it's fragile and depends on:
+
+- The query being truly read-only
+- The transaction having fully committed before subscribers are notified
+- No other code paths bypassing the queue
+- SQLite's read concurrency guarantees
+
+* How Many Bypasses Exist?
+
+** Search Results
+
+#+begin_src bash
+grep -r "Memory\.(query|transact)" packages/memory/
+#+end_src
+
+Result: *Only ONE place* bypasses the queue!
+
+#+begin_example
+packages/memory/provider.ts:504
+#+end_example
+
+This is good - the bypass is isolated and well-documented.
+
+* Root Cause: Architecture Design Flaw
+
+** The Real Problem
+
+The architecture has a fundamental issue:
+
+#+begin_quote
+*Subscriber notifications should NOT be synchronous*
+#+end_quote
+
+** Current Design (Problematic)
+
+#+begin_src typescript
+// BLOCKING on subscribers
+for (const subscriber of subscribers) {
+  await subscriber.commit(result.ok);  // ← Blocks transaction!
+}
+#+end_src
+
+Problems:
+- Transaction cannot complete until ALL subscribers finish
+- Subscribers cannot query without deadlocking
+- Creates tight coupling between transaction and notification
+- Defeats the purpose of the serialization queue
+
+** Better Design Option 1: Fire-and-Forget
+
+#+begin_src typescript
+// NON-BLOCKING, fire-and-forget
+for (const subscriber of subscribers) {
+  // Don't await! Let them run async
+  subscriber.commit(result.ok).catch(err => logger.error(err));
+}
+// Transaction completes immediately
+#+end_src
+
+Benefits:
+- No deadlock possible
+- Transaction completes faster
+- Subscribers can query freely
+- Looser coupling
+
+Drawbacks:
+- No guarantee subscribers processed the commit
+- Errors in subscribers don't fail the transaction
+- Harder to test
+
+** Better Design Option 2: Message Queue
+
+#+begin_src typescript
+// Post to a message queue
+for (const subscriber of subscribers) {
+  messageQueue.publish('commit', { subscriber, commit: result.ok });
+}
+// Subscribers consume from queue independently
+#+end_src
+
+Benefits:
+- Complete decoupling
+- Subscribers can retry on failure
+- Can add rate limiting, backpressure
+- Scalable
+
+Drawbacks:
+- More complex infrastructure
+- Eventual consistency (subscribers notified async)
+
+** Better Design Option 3: Separate Read Connection for Subscribers
+
+#+begin_src typescript
+class MemoryProviderSession {
+  constructor(
+    public memory: MemorySession,
+    public subscriberReadConnection: Database,  // ← Dedicated read connection
+  ) {}
+
+  private async getSchemaSubscriptionMatches(...) {
+    // Use subscriberReadConnection, not memory.querySchema()
+    const result = await querySchemaDirectly(
+      this.subscriberReadConnection,
+      newInvocation
+    );
+  }
+}
+#+end_src
+
+Benefits:
+- Keeps synchronous notification pattern
+- No deadlock (separate connection)
+- Explicit about the special case
+
+Drawbacks:
+- More connections = more memory
+- Requires WAL mode to be safe
+- Doesn't solve the architectural flaw
+
+* Implications for WAL Mode
+
+** Current Situation (No WAL)
+
+The bypass is relatively safe:
+- Only one write at a time (enforced by =perform()= queue)
+- Bypass query runs while queue is locked
+- No other transactions can interfere
+- Read concurrency is safe in SQLite even without WAL
+
+** With WAL Mode + Read Pool
+
+The bypass becomes *LESS safe*:
+
+1. Multiple queries could run concurrently with the bypassed query
+2. The bypassed query might read partial state if another write is in progress
+3. Race conditions become more likely
+4. Need more sophisticated synchronization
+
+** What Must Happen Before Enabling WAL
+
+Either:
+
+1. *Refactor subscriber notifications to be async/non-blocking*
+   - Remove the =await= in subscriber loop
+   - Accept eventual consistency
+
+2. *Give subscribers their own read connection*
+   - Not shared with main connection pool
+   - Dedicated to subscriber queries
+
+3. *Add extensive testing*
+   - Test subscriber notification path with concurrent queries
+   - Verify no race conditions
+   - Stress test with multiple subscribers
+
+* Recommendation
+
+** Immediate Action
+
+Document this extensively in the code:
+
+#+begin_src typescript
+// CRITICAL: This bypasses the perform() queue to avoid deadlock.
+//
+// CONTEXT: We are inside a transaction's subscriber notification phase.
+// The transaction has completed and committed, but the perform() queue
+// is still locked waiting for subscriber notifications to finish.
+//
+// If we called this.memory.querySchema(), it would go through perform(),
+// which would deadlock because:
+// 1. perform() queue is locked by the current transaction
+// 2. transaction is waiting for this subscriber.commit() to finish
+// 3. subscriber.commit() would wait for querySchema()
+// 4. querySchema() would wait for perform() queue
+// 5. DEADLOCK
+//
+// SAFETY: This is safe (for now) because:
+// - The transaction has already committed (no partial state)
+// - The perform() queue lock prevents other writes
+// - SQLite allows concurrent reads
+// - This query is read-only
+//
+// RISK: If we enable WAL mode + read connection pool, this becomes
+// less safe because multiple queries could run concurrently.
+//
+// TODO: Refactor subscriber notifications to be async/non-blocking
+// to eliminate this bypass entirely.
+const result = await Memory.querySchema(
+  this.memory as Memory.Memory,
+  newInvocation,
+);
+#+end_src
+
+** Before Enabling WAL Mode
+
+Choose one:
+
+1. *Refactor to async subscribers* (preferred)
+   - Cleanest solution
+   - Fixes root cause
+   - Requires testing notification handling
+
+2. *Dedicated subscriber connection*
+   - Quick fix
+   - Doesn't fix root cause
+   - Acceptable if async refactor is too risky
+
+3. *Extensive testing + monitoring*
+   - Last resort
+   - Document the edge cases
+   - Add metrics to detect issues
+
+* Conclusion
+
+The bypass at =provider.ts:504= is:
+
+- ✅ Necessary (prevents genuine deadlock)
+- ✅ Well-documented (has comment explaining why)
+- ✅ Isolated (only one bypass in entire codebase)
+- ⚠️  Fragile (depends on specific timing and guarantees)
+- ⚠️  Architectural flaw (symptom of synchronous subscriber design)
+- ❌ Risk with WAL mode (becomes less safe with increased concurrency)
+
+*Bottom line:* This is a clever workaround for a design problem. It works now, but is a ticking time bomb if concurrency increases via WAL mode. The proper fix is to make subscriber notifications asynchronous.
+
+* References
+
+- [[file:../packages/memory/memory.ts::87][memory.ts:87-96]] - Methods that use perform() queue
+- [[file:../packages/memory/memory.ts::170][memory.ts:170-212]] - Transaction with subscriber notification
+- [[file:../packages/memory/provider.ts::369][provider.ts:369-416]] - Subscriber commit() method
+- [[file:../packages/memory/provider.ts::487][provider.ts:487-539]] - The bypass location
+- [[file:./q3-wal-mode-and-read-pools.org][Q3 Report: WAL Mode and Read Pools]]
