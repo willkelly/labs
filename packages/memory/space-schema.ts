@@ -49,6 +49,7 @@ import {
   type SelectedFact,
   selectFact,
   selectFacts,
+  selectFactsConcurrent,
   type Session as SpaceStoreSession,
   toSelection,
 } from "./space.ts";
@@ -77,11 +78,35 @@ export class ServerObjectManager extends BaseObjectManager<
   >();
   private restrictedValues = new Set<string>();
 
+  // Connection pool for concurrent reads (optional for backwards compatibility)
+  private pool?: PoolLike;
+  // Queue of pending loads for batched concurrent execution
+  private pendingLoads = new Map<string, BaseMemoryAddress>();
+  // When true, load() queues instead of executing immediately
+  private batchingMode = false;
+
   constructor(
     private session: SpaceStoreSession<MemorySpace>,
     private providedClassifications: Set<string>,
+    pool?: PoolLike,
   ) {
     super();
+    this.pool = pool;
+  }
+
+  /**
+   * Enable batching mode where load() queues instead of executing immediately.
+   * Use flushLoads() to execute all queued loads concurrently.
+   */
+  enableBatching(): void {
+    this.batchingMode = true;
+  }
+
+  /**
+   * Disable batching mode and return to immediate load execution.
+   */
+  disableBatching(): void {
+    this.batchingMode = false;
   }
 
   /**
@@ -98,6 +123,15 @@ export class ServerObjectManager extends BaseObjectManager<
     } else if (this.restrictedValues.has(key)) {
       return null;
     }
+
+    // If in batching mode, queue the load and return null
+    // Caller must call flushLoads() to execute queued loads
+    if (this.batchingMode && this.pool) {
+      this.queueLoad(address);
+      return null;
+    }
+
+    // Otherwise, execute load immediately (original behavior)
     const fact = selectFact(this.session, {
       of: address.id,
       the: address.type,
@@ -148,17 +182,112 @@ export class ServerObjectManager extends BaseObjectManager<
   getDetails(address: BaseMemoryAddress) {
     return this.factDetails.get(this.toKey(address));
   }
+
+  /**
+   * Queue a load operation for batched concurrent execution.
+   * Use flushLoads() to execute all queued loads at once.
+   *
+   * @param address The address to load
+   */
+  queueLoad(address: BaseMemoryAddress): void {
+    const key = this.toKey(address);
+    // Skip if already loaded or queued
+    if (!this.readValues.has(key) && !this.restrictedValues.has(key)) {
+      this.pendingLoads.set(key, address);
+    }
+  }
+
+  /**
+   * Execute all queued loads concurrently using the connection pool.
+   * Falls back to sequential loading if no pool is available.
+   *
+   * @returns Promise that resolves when all loads complete
+   */
+  async flushLoads(): Promise<void> {
+    if (this.pendingLoads.size === 0) {
+      return;
+    }
+
+    const loads = Array.from(this.pendingLoads.values());
+    this.pendingLoads.clear();
+
+    // If we have a connection pool, execute loads concurrently
+    if (this.pool) {
+      const queries = loads.map((address) => ({
+        of: address.id,
+        the: address.type,
+      }));
+
+      const results = await selectFactsConcurrent(
+        this.pool,
+        queries,
+        this.session.cache,
+      );
+
+      // Process results in order
+      for (let i = 0; i < loads.length; i++) {
+        const address = loads[i];
+        const fact = results[i];
+        const key = this.toKey(address);
+
+        if (fact !== undefined) {
+          const factAddress = { id: fact.of, type: fact.the, path: [] };
+          const valueEntry = {
+            address: factAddress,
+            value: fact.is ? (fact.is as JSONObject) : undefined,
+          };
+
+          if (!this.readLabels.has(factAddress.id)) {
+            const label = getLabel(this.session, factAddress.id);
+            this.readLabels.set(factAddress.id, label);
+          }
+
+          const labelEntry = this.readLabels.get(factAddress.id);
+          if (labelEntry?.is) {
+            const requiredClassifications = getClassifications({
+              is: labelEntry.is,
+              since: labelEntry.since,
+            });
+            if (!requiredClassifications.isSubsetOf(this.providedClassifications)) {
+              logger.info(
+                () => ["Skipping inclusion of", fact.of, "due to classification"],
+              );
+              this.restrictedValues.add(key);
+              continue;
+            }
+          }
+
+          this.factDetails.set(key, {
+            cause: fact.cause,
+            since: fact.since,
+          });
+          this.readValues.set(key, valueEntry);
+        }
+      }
+    } else {
+      // No pool available, fall back to sequential loading
+      for (const address of loads) {
+        this.load(address);
+      }
+    }
+  }
 }
 
-export const selectSchema = <Space extends MemorySpace>(
+export interface PoolLike {
+  withConnection: <T>(fn: (db: any) => T | Promise<T>) => Promise<T>;
+  close(): void;
+}
+
+export const selectSchema = async <Space extends MemorySpace>(
   session: SpaceStoreSession<Space>,
   { selectSchema, since, classification }: SchemaQuery["args"],
-): FactSelection => {
+  pool?: PoolLike,
+): Promise<FactSelection> => {
   const startTime = performance.timeOrigin + performance.now();
 
   const providedClassifications = new Set<string>(classification);
   // Track any docs loaded while traversing the factSelection
-  const manager = new ServerObjectManager(session, providedClassifications);
+  const manager = new ServerObjectManager(session, providedClassifications, pool);
   // while loading dependent docs, we want to avoid cycles
   const tracker = new CompoundCycleTracker<
     Immutable<JSONValue>,
@@ -168,6 +297,10 @@ export const selectSchema = <Space extends MemorySpace>(
   const schemaTracker = new MapSet<string, SchemaPathSelector>(deepEqual);
 
   const includedFacts: FactSelection = {}; // we'll store all the raw facts we accesed here
+
+  // Enable batching mode to queue loads during traversal
+  manager.enableBatching();
+
   // First, collect all the potentially relevant facts (without dereferencing pointers)
   for (
     const selectorEntry of iterateSelector(selectSchema, DefaultSchemaSelector)
@@ -185,6 +318,7 @@ export const selectSchema = <Space extends MemorySpace>(
 
       // Then filter the facts by the associated schemas, which will dereference
       // pointers as we walk through the structure.
+      // In batching mode, this will queue loads instead of executing them
       loadFactsForDoc(
         manager,
         entry,
@@ -193,14 +327,19 @@ export const selectSchema = <Space extends MemorySpace>(
         cfc,
         schemaTracker,
       );
-
-      // Add any facts that we accessed while traversing the object with its schema
-      // We'll need the same set of objects on the client to traverse it there.
-      for (const included of manager.getReadDocs()) {
-        const details = manager.getDetails(included.address)!;
-        addToSelection(includedFacts, included, details.cause, details.since);
-      }
     }
+  }
+
+  // Execute all queued loads concurrently
+  await manager.flushLoads();
+
+  // Disable batching mode
+  manager.disableBatching();
+
+  // Now add all the facts that were loaded
+  for (const included of manager.getReadDocs()) {
+    const details = manager.getDetails(included.address)!;
+    addToSelection(includedFacts, included, details.cause, details.since);
   }
 
   // We want to collect the classification tags on our included facts
