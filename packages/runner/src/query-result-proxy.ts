@@ -93,7 +93,7 @@ export function createQueryResultProxy<T>(
   link = resolveLink(readTx, link);
   const value = readTx.readValueOrThrow(link) as any;
 
-  if (!isRecord(value) || Object.isFrozen(value)) return value;
+  if (!isRecord(value)) return value;
 
   // Get the appropriate cache index by log
   const cacheIndex = tx ?? defaultTx;
@@ -103,18 +103,22 @@ export function createQueryResultProxy<T>(
     proxyCacheByTx.set(cacheIndex, txCache);
   }
 
-  // Check if we already have a proxy for this target in the cache
-  const existingProxy = txCache?.get(value);
+  // Don't cache proxies for frozen (interned) objects - same object can exist
+  // at multiple paths, and each proxy needs its own path for correct writes.
+  // The structural sharing benefit comes from the underlying frozen values.
+  const existingProxy = !Object.isFrozen(value) && txCache?.get(value);
   if (existingProxy) return existingProxy;
 
-  const proxy = new Proxy(value as object, {
+  // For frozen objects, we need to create a shallow copy for the proxy target
+  // because proxy invariants require non-configurable properties to return
+  // their actual values. A shallow copy has configurable properties, so the
+  // proxy can return wrapped values (like other proxies for nested access).
+  const proxyTarget = Object.isFrozen(value)
+    ? (Array.isArray(value) ? [...value] : { ...value })
+    : value;
+
+  const proxy = new Proxy(proxyTarget as object, {
     get: (target, prop, receiver) => {
-      // When encountering a frozen property, we just return the value to
-      // maintain proxy invariants.
-      const descriptor = Object.getOwnPropertyDescriptor(target, prop);
-      if (descriptor?.configurable === false) {
-        return Reflect.get(target, prop, receiver);
-      }
 
       if (typeof prop === "symbol") {
         if (prop === toCell) {
@@ -245,7 +249,7 @@ export function createQueryResultProxy<T>(
               context: getTopFrame()?.cause ?? "unknown",
             });
 
-            // Update target from store
+            // Update target from store (skip if frozen, as proxy reads fresh from storage)
             const newValue = tx.readValueOrThrow(link) as typeof value;
 
             if (!Array.isArray(newValue)) {
@@ -254,7 +258,10 @@ export function createQueryResultProxy<T>(
               );
             }
 
-            value.splice(0, value.length, ...newValue);
+            // Only update target if not frozen (interned objects are frozen)
+            if (!Object.isFrozen(value)) {
+              value.splice(0, value.length, ...newValue);
+            }
 
             if (Array.isArray(result)) {
               const cause = {
@@ -309,8 +316,10 @@ export function createQueryResultProxy<T>(
     },
   }) as T;
 
-  // Cache the proxy in the appropriate cache before returning
-  txCache.set(value, proxy);
+  // Cache the proxy (skip for frozen objects - they may appear at multiple paths)
+  if (!Object.isFrozen(value)) {
+    txCache.set(value, proxy);
+  }
   return proxy;
 }
 

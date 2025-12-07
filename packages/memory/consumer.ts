@@ -67,6 +67,7 @@ export * from "./interface.ts";
 import { toRevision } from "./commit.ts";
 import { SchemaNone } from "./schema.ts";
 import { getLogger } from "@commontools/utils/logger";
+import { internStringify } from "@commontools/runner/interning";
 
 const logger = getLogger("memory-consumer", {
   enabled: true,
@@ -460,8 +461,8 @@ class ConsumerInvocation<Ability extends string, Protocol extends Proto> {
   }
 
   constructor(source: ConsumerInvocationFor<Ability, Protocol>) {
-    // JSON.parse(JSON.stringify) is used to strip `undefined` values and ensure consistent serialization
-    this.source = JSON.parse(JSON.stringify(source));
+    // internStringify strips `undefined` values, ensures JSON serializability, and returns frozen interned object
+    this.source = internStringify(source);
     this.#reference = refer(this.source);
     let receive;
     this.promise = new Promise<ConsumerResultFor<Ability, Protocol>>(
