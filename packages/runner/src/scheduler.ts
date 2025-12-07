@@ -95,6 +95,13 @@ export class Scheduler implements IScheduler {
   private tries = new Map<SpaceAndURI, SubscriptionTrie>();
   private retries = new WeakMap<Action, number>();
 
+  /**
+   * Per-entity cache of interned states.
+   * When a notification arrives, we use the cached state as `oldState` and only
+   * intern `change.after`. This avoids re-interning `before` on every notification.
+   */
+  private internedStates = new Map<SpaceAndURI, any>();
+
   /** Aggregate metrics for debugging notification efficiency */
   public metrics = {
     storageNotifications: 0,
@@ -463,10 +470,18 @@ export class Scheduler implements IScheduler {
                 `[CHANGE ${changeIndex}] Found trie for ${spaceAndURI}`,
               ]);
 
-              // Intern both before and after for O(1) subtree comparison via ===
-              // Handle undefined before/after (entity creation/deletion)
-              const oldState = change.before !== undefined ? internStringify(change.before) : undefined;
+              // Use cached interned state as oldState to avoid re-interning
+              // Only intern change.after, then cache it for next notification
+              const oldState = this.internedStates.get(spaceAndURI);
               const newState = change.after !== undefined ? internStringify(change.after) : undefined;
+
+              // Cache the new interned state for next notification
+              if (newState !== undefined) {
+                this.internedStates.set(spaceAndURI, newState);
+              } else {
+                // Entity deleted - remove from cache
+                this.internedStates.delete(spaceAndURI);
+              }
 
               const onTriggered = (action: Function) => {
                 this.metrics.actionsTriggered++;
