@@ -224,9 +224,15 @@ function internReviver(key: string, value: any): any {
  * plus a value-based cache for structural deduplication.
  *
  * @param jsonString - The JSON string to parse
- * @returns A frozen, interned object
+ * @param skipIntern - If true, skip interning and return plain JSON.parse result (for already-immutable data like data URIs)
+ * @returns A frozen, interned object (or plain object if skipIntern is true)
  */
-export function internParse(jsonString: string): any {
+export function internParse(jsonString: string, skipIntern = false): any {
+  // If skipIntern is true, just parse without any interning overhead
+  if (skipIntern) {
+    return JSON.parse(jsonString);
+  }
+
   // Fast path: check if we've already parsed this exact string
   // Use SHA-256 hash (via refer) as key - collision resistant and avoids storing large strings
   const cacheKey = refer(jsonString).toString();

@@ -16,6 +16,7 @@ import type {
 } from "../interface.ts";
 import { unclaimed } from "@commontools/memory/fact";
 import { getLogger } from "@commontools/utils/logger";
+import { internParse } from "../../interning.ts";
 
 const logger = getLogger("attestation", {
   enabled: false,
@@ -345,9 +346,10 @@ export const load = (
           };
         } else if (mediaType === "application/json") {
           // Handle JSON media type
+          // Data URIs are immutable by design, so skip interning to avoid overhead
           let value: JSONValue;
           try {
-            value = JSON.parse(content);
+            value = internParse(content, true);
             result = { ok: { address: { ...address, path: [] }, value } };
           } catch (error) {
             const reason = error as Error;
