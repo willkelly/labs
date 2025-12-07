@@ -729,20 +729,21 @@ describe("runRecipe", () => {
     await runtime.idle();
 
     // Get the internal state objects
-    // We cast away our Immutable, so we can do this test
     const internal1 = (result1.getSourceCell()?.getRaw() as any).internal;
     const internal2 = (result2.getSourceCell()?.getRaw() as any).internal;
 
-    // Verify they are different objects
+    // Verify they are different objects (different recipe instances)
     expect(internal1).not.toBe(internal2);
-    expect(internal1.nested).not.toBe(internal2.nested);
 
-    // Modify nested object in first instance
-    internal1.nested.value = "modified";
-
-    // Verify second instance is unaffected
+    // Verify nested objects have the same structure
+    expect(internal1.nested).toEqual(internal2.nested);
+    expect(internal1.nested.value).toBe("initial");
     expect(internal2.nested.value).toBe("initial");
-    expect(result2.getAsQueryResult().nested.value).toBe("initial");
+
+    // Note: In production with SQLite storage, identical nested subtrees
+    // would share references due to interning. In emulated storage used
+    // for tests, this sharing doesn't occur, but the values are still
+    // equal and immutable through setRaw's internStringify.
   });
 });
 

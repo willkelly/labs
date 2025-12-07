@@ -57,6 +57,7 @@ import { SelectAllString } from "./schema.ts";
 import * as Error from "./error.ts";
 import { selectSchema } from "./space-schema.ts";
 import { JSONValue } from "@commontools/runner";
+import { internParse } from "@commontools/runner/interning";
 import { isObject } from "../utils/src/types.ts";
 export type * from "./interface.ts";
 
@@ -530,7 +531,7 @@ const recall = <Space extends MemorySpace>(
     };
 
     if (row.is) {
-      revision.is = JSON.parse(row.is);
+      revision.is = internParse(row.is);
     }
 
     return revision;
@@ -608,7 +609,7 @@ const getFact = <Space extends MemorySpace>(
     since: row.since,
   };
   if (row.is) {
-    revision.is = JSON.parse(row.is);
+    revision.is = internParse(row.is);
   }
   return revision;
 };
@@ -666,7 +667,7 @@ const toFact = function (row: StateRow): SelectedFact {
     cause: row.cause
       ? row.cause as CauseString
       : unclaimedRef(row as FactAddress).toString() as CauseString,
-    is: row.is ? JSON.parse(row.is) as JSONValue : undefined,
+    is: row.is ? internParse(row.is) as JSONValue : undefined,
     since: row.since,
   };
 };
@@ -900,7 +901,7 @@ const commit = <Space extends MemorySpace>(
   const row = stmt.get({ the, of }) as StateRow | undefined;
   const [since, cause] = row
     ? [
-      (JSON.parse(row.is as string) as CommitData).since + 1,
+      (internParse(row.is as string) as CommitData).since + 1,
       fromString(row.fact) as Reference<Assertion>,
     ]
     : [0, unclaimedRef({ the, of })];

@@ -75,6 +75,7 @@ import {
 } from "./storage/extended-storage-transaction.ts";
 import { fromURI } from "./uri-utils.ts";
 import { ContextualFlowControl } from "./cfc.ts";
+import { internStringify } from "./interning.ts";
 
 // Shared map factory instance for all cells
 let mapFactory: NodeFactory<any, any> | undefined;
@@ -943,7 +944,9 @@ export class CellImpl<T> implements ICell<T>, IStreamable<T> {
     if (!this.synced) this.sync();
 
     try {
-      value = JSON.parse(JSON.stringify(value));
+      // internStringify validates JSON serializability and returns a frozen, interned object
+      // This enables structural sharing and O(1) change detection via reference equality
+      value = internStringify(value);
     } catch (e) {
       console.error("Can't set raw value, it's not JSON serializable", e);
       return;

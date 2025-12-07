@@ -6,6 +6,7 @@
   },
   "exports": {
     ".": "./src/index.ts",
+    "./interning": "./src/interning.ts",
     "./storage/inspector": "./src/storage/inspector.ts",
     "./storage/telemetry": "./src/storage/telemetry.ts",
     "./traverse": "./src/traverse.ts",
