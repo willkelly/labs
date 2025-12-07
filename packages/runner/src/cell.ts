@@ -76,6 +76,11 @@ import {
 import { fromURI } from "./uri-utils.ts";
 import { ContextualFlowControl } from "./cfc.ts";
 import { internStringify } from "./interning.ts";
+import { SubscriptionTrie, PRIORITY_SYNC } from "./subscription-trie.ts";
+
+export type SinkOptions = {
+  path?: (string | number)[];
+};
 
 // Shared map factory instance for all cells
 let mapFactory: NodeFactory<any, any> | undefined;
@@ -123,7 +128,7 @@ declare module "@commontools/api" {
     ): Cell<T>;
     asSchemaFromLinks<T = unknown>(): Cell<T>;
     withTx(tx?: IExtendedStorageTransaction): Cell<T>;
-    sink(callback: (value: Readonly<T>) => Cancel | undefined | void): Cancel;
+    sink(callback: (value: Readonly<T>) => Cancel | undefined | void, options?: SinkOptions): Cancel;
     sync(): Promise<Cell<T>> | Cell<T>;
     getAsQueryResult<Path extends PropertyKey[]>(
       path?: Readonly<Path>,
@@ -849,7 +854,7 @@ export class CellImpl<T> implements ICell<T>, IStreamable<T> {
     ) as unknown as Cell<T>;
   }
 
-  sink(callback: (value: Readonly<T>) => Cancel | undefined | void): Cancel {
+  sink(callback: (value: Readonly<T>) => Cancel | undefined | void, options?: SinkOptions): Cancel {
     // Check if this is a stream
     if (this.isStream()) {
       // Stream behavior: add listener
@@ -863,7 +868,14 @@ export class CellImpl<T> implements ICell<T>, IStreamable<T> {
     } else {
       // Regular cell behavior: subscribe to changes
       if (!this.synced) this.sync(); // No await, just kicking this off
-      return subscribeToReferencedDocs(callback, this.runtime, this.link);
+
+      // If path-based subscription is requested
+      if (options?.path) {
+        return subscribeToPathInDoc(callback, this.runtime, this.link, options.path);
+      } else {
+        // Default behavior: subscribe to all referenced docs
+        return subscribeToReferencedDocs(callback, this.runtime, this.link);
+      }
     }
   }
 
@@ -1313,6 +1325,74 @@ function subscribeToReferencedDocs<T>(
     cancel();
     if (isCancel(cleanup)) cleanup();
   };
+}
+
+/**
+ * Subscribe to changes at a specific path within a document using the scheduler's subscription trie.
+ * This provides efficient path-based notifications without needing to traverse the entire document.
+ */
+function subscribeToPathInDoc<T>(
+  callback: (value: T) => Cancel | undefined | void,
+  runtime: IRuntime,
+  link: NormalizedFullLink,
+  path: (string | number)[],
+): Cancel {
+  // Get or create the subscription trie for this entity
+  const spaceAndURI = `${link.space}/${link.id}` as `${typeof link.space}/${typeof link.id}`;
+
+  // Access the scheduler's tries map
+  const scheduler = runtime.scheduler as any;
+  if (!scheduler.tries) {
+    throw new Error("Scheduler does not support subscription tries");
+  }
+
+  // Get or create trie for this entity
+  if (!scheduler.tries.has(spaceAndURI)) {
+    scheduler.tries.set(spaceAndURI, new SubscriptionTrie());
+  }
+  const trie = scheduler.tries.get(spaceAndURI) as SubscriptionTrie;
+
+  // Build the full path including the cell's path and the subscription path
+  const fullPath = ["value", ...link.path, ...path].map(String);
+
+  // Get the initial value at the path
+  const tx = runtime.edit();
+  const currentValue = tx.readValueOrThrow(link);
+  let valueAtPath = getValueAtPath(currentValue, [...link.path, ...path]);
+
+  // Call the callback with the initial value
+  let cleanup: Cancel | undefined | void = callback(valueAtPath as T);
+  tx.commit();
+
+  // Subscribe to the trie at the specified path
+  const unsubscribe = trie.subscribe(fullPath, () => {
+    // When notified, read the new value at the path and invoke callback
+    if (isCancel(cleanup)) cleanup();
+
+    const tx = runtime.edit();
+    const newCurrentValue = tx.readValueOrThrow(link);
+    const newValueAtPath = getValueAtPath(newCurrentValue, [...link.path, ...path]);
+
+    cleanup = callback(newValueAtPath as T);
+    tx.commit();
+  }, PRIORITY_SYNC);
+
+  return () => {
+    unsubscribe();
+    if (isCancel(cleanup)) cleanup();
+  };
+}
+
+/**
+ * Helper function to get a value at a specific path in an object
+ */
+function getValueAtPath(obj: any, path: (string | number)[]): any {
+  let current = obj;
+  for (const key of path) {
+    if (current == null) return undefined;
+    current = current[key];
+  }
+  return current;
 }
 
 /**

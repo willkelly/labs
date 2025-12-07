@@ -290,6 +290,21 @@ export interface IRuntime {
   start<T = any>(resultCell: Cell<T>): void;
 }
 
+/** Scheduler metrics for debugging notification efficiency */
+export interface SchedulerMetrics {
+  storageNotifications: number;
+  changesReceived: number;
+  actionsTriggered: number;
+  changesSkippedNoSubscribers: number;
+}
+
+/** Aggregated trie metrics */
+export interface TrieMetricsSummary {
+  nodesVisited: number;
+  subtreesSkipped: number;
+  actionsTriggered: number;
+}
+
 export interface IScheduler {
   readonly runtime: IRuntime;
   idle(): Promise<void>;
@@ -309,6 +324,13 @@ export interface IScheduler {
   ): void;
   addEventHandler(handler: EventHandler, ref: NormalizedFullLink): Cancel;
   runningPromise: Promise<unknown> | undefined;
+
+  /** Metrics for debugging notification efficiency */
+  metrics: SchedulerMetrics;
+  /** Reset all metrics counters */
+  resetMetrics(): void;
+  /** Get aggregated trie metrics across all entities */
+  getTrieMetrics(): TrieMetricsSummary;
 }
 
 export interface IRecipeManager {

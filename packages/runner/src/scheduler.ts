@@ -30,10 +30,10 @@ import type {
 import {
   addressesToPathByEntity,
   arraysOverlap,
-  determineTriggeredActions,
   sortAndCompactPaths,
-  type SortedAndCompactPaths,
 } from "./reactive-dependencies.ts";
+import { SubscriptionTrie, PRIORITY_SYNC } from "./subscription-trie.ts";
+import { internStringify } from "./interning.ts";
 
 const logger = getLogger("scheduler", {
   enabled: false,
@@ -92,8 +92,43 @@ export class Scheduler implements IScheduler {
   private pending = new Set<Action>();
   private dependencies = new WeakMap<Action, ReactivityLog>();
   private cancels = new WeakMap<Action, Cancel>();
-  private triggers = new Map<SpaceAndURI, Map<Action, SortedAndCompactPaths>>();
+  private tries = new Map<SpaceAndURI, SubscriptionTrie>();
   private retries = new WeakMap<Action, number>();
+
+  /** Aggregate metrics for debugging notification efficiency */
+  public metrics = {
+    storageNotifications: 0,
+    changesReceived: 0,
+    actionsTriggered: 0,
+    changesSkippedNoSubscribers: 0,
+  };
+
+  /** Reset scheduler metrics */
+  public resetMetrics(): void {
+    this.metrics = {
+      storageNotifications: 0,
+      changesReceived: 0,
+      actionsTriggered: 0,
+      changesSkippedNoSubscribers: 0,
+    };
+    // Also reset all trie metrics
+    for (const trie of this.tries.values()) {
+      trie.resetMetrics();
+    }
+  }
+
+  /** Get aggregated trie metrics */
+  public getTrieMetrics(): { nodesVisited: number; subtreesSkipped: number; actionsTriggered: number } {
+    let nodesVisited = 0;
+    let subtreesSkipped = 0;
+    let actionsTriggered = 0;
+    for (const trie of this.tries.values()) {
+      nodesVisited += trie.metrics.nodesVisited;
+      subtreesSkipped += trie.metrics.subtreesSkipped;
+      actionsTriggered += trie.metrics.actionsTriggered;
+    }
+    return { nodesVisited, subtreesSkipped, actionsTriggered };
+  }
 
   private idlePromises: (() => void)[] = [];
   private loopCounter = new WeakMap<Action, number>();
@@ -172,34 +207,40 @@ export class Scheduler implements IScheduler {
         `Reads: ${reads.length}`,
       ]);
 
-      const entities = new Set<SpaceAndURI>();
+      const unsubscribeFunctions: (() => void)[] = [];
 
       for (const [spaceAndURI, paths] of pathsByEntity) {
-        entities.add(spaceAndURI);
-        if (!this.triggers.has(spaceAndURI)) {
-          this.triggers.set(spaceAndURI, new Map());
+        // Create a new SubscriptionTrie for this entity if it doesn't exist
+        if (!this.tries.has(spaceAndURI)) {
+          this.tries.set(spaceAndURI, new SubscriptionTrie());
         }
-        const pathsWithValues = paths.map((path) =>
-          [
+        const trie = this.tries.get(spaceAndURI)!;
+
+        // Subscribe to each path in the trie
+        for (const path of paths) {
+          const pathWithValue = [
             "value",
             ...path,
-          ] as readonly MemoryAddressPathComponent[]
-        );
-        this.triggers.get(spaceAndURI)!.set(action, pathsWithValues);
+          ] as readonly MemoryAddressPathComponent[];
+          const pathAsStringArray = pathWithValue.map(String);
 
-        logger.debug("schedule", () => [
-          `[SUBSCRIBE] Registered action for ${spaceAndURI}`,
-          `Paths: ${pathsWithValues.map((p) => p.join("/")).join(", ")}`,
-        ]);
+          logger.debug("schedule", () => [
+            `[SUBSCRIBE] Registered action for ${spaceAndURI}`,
+            `Path: ${pathAsStringArray.join("/")}`,
+          ]);
+
+          const unsubscribe = trie.subscribe(pathAsStringArray, action, PRIORITY_SYNC);
+          unsubscribeFunctions.push(unsubscribe);
+        }
       }
 
       this.cancels.set(action, () => {
         logger.debug("schedule", () => [
           `[UNSUBSCRIBE] Action: ${action.name || "anonymous"}`,
-          `Entities: ${entities.size}`,
+          `Unsubscribing from ${unsubscribeFunctions.length} paths`,
         ]);
-        for (const spaceAndURI of entities) {
-          this.triggers.get(spaceAndURI)?.delete(action);
+        for (const unsubscribe of unsubscribeFunctions) {
+          unsubscribe();
         }
       });
     }
@@ -391,9 +432,11 @@ export class Scheduler implements IScheduler {
         ]);
 
         if ("changes" in notification) {
+          this.metrics.storageNotifications++;
           let changeIndex = 0;
           for (const change of notification.changes) {
             changeIndex++;
+            this.metrics.changesReceived++;
             logger.debug("schedule", () => [
               `[CHANGE ${changeIndex}]`,
               `Address: ${change.address.id}/${change.address.path.join("/")}`,
@@ -413,35 +456,42 @@ export class Scheduler implements IScheduler {
             }
 
             const spaceAndURI = `${space}/${change.address.id}` as SpaceAndURI;
-            const paths = this.triggers.get(spaceAndURI);
+            const trie = this.tries.get(spaceAndURI);
 
-            if (paths) {
+            if (trie) {
               logger.debug("schedule", () => [
-                `[CHANGE ${changeIndex}] Found ${paths.size} registered actions for ${spaceAndURI}`,
+                `[CHANGE ${changeIndex}] Found trie for ${spaceAndURI}`,
               ]);
 
-              const triggeredActions = determineTriggeredActions(
-                paths,
-                change.before,
-                change.after,
-                change.address.path,
-              );
+              // Intern both before and after for O(1) subtree comparison via ===
+              // Handle undefined before/after (entity creation/deletion)
+              const oldState = change.before !== undefined ? internStringify(change.before) : undefined;
+              const newState = change.after !== undefined ? internStringify(change.after) : undefined;
 
-              logger.debug("schedule", () => [
-                `[CHANGE ${changeIndex}] Triggered ${triggeredActions.length} actions`,
-              ]);
-
-              for (const action of triggeredActions) {
+              const onTriggered = (action: Function) => {
+                this.metrics.actionsTriggered++;
                 logger.debug("schedule", () => [
                   `[TRIGGERED] Action for ${spaceAndURI}/${
                     change.address.path.join("/")
                   }`,
-                  `Action name: ${action.name || "anonymous"}`,
+                  `Action name: ${(action as Action).name || "anonymous"}`,
                 ]);
                 this.queueExecution();
-                this.pending.add(action);
+                this.pending.add(action as Action);
+              };
+
+              // For root-level changes, use notify() since data includes the "value" wrapper
+              // For path-specific changes, use notifyAtPath with the "value" prefix
+              if (change.address.path.length === 0) {
+                // Root change: data is the whole entity {value: ...}, trie walks from root
+                trie.notify(oldState, newState, onTriggered);
+              } else {
+                // Path-specific change: add "value" prefix to match subscription paths
+                const changePath = ["value", ...change.address.path.map(String)];
+                trie.notifyAtPath(changePath, oldState, newState, onTriggered);
               }
             } else {
+              this.metrics.changesSkippedNoSubscribers++;
               logger.debug("schedule", () => [
                 `[CHANGE ${changeIndex}] No registered actions for ${spaceAndURI}`,
               ]);

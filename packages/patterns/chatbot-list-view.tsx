@@ -2,7 +2,6 @@
 import {
   Cell,
   Default,
-  derive,
   handler,
   ID,
   ifElse,
@@ -13,7 +12,6 @@ import {
   recipe,
   toSchema,
   UI,
-  wish,
 } from "commontools";
 
 import Chat from "./chatbot-note-composed.tsx";
@@ -86,7 +84,6 @@ const storeCharm = lift(
     charm: any;
     selectedCharm: Cell<Default<{ charm: any }, { charm: undefined }>>;
     charmsList: Cell<CharmEntry[]>;
-    allCharms: Cell<MentionableCharm[]>;
     theme?: {
       accentColor: Default<string, "#3b82f6">;
       fontFace: Default<string, "system-ui, -apple-system, sans-serif">;
@@ -95,7 +92,7 @@ const storeCharm = lift(
     isInitialized: Cell<boolean>;
   }>(),
   undefined,
-  ({ charm, selectedCharm, charmsList, isInitialized, allCharms: _ }) => { // Not including `allCharms` is a compile error...
+  ({ charm, selectedCharm, charmsList, isInitialized }) => {
     if (!isInitialized.get()) {
       console.log(
         "storeCharm storing charm:",
@@ -119,12 +116,11 @@ const storeCharm = lift(
 const populateChatList = lift(
   toSchema<{
     charmsList: CharmEntry[];
-    allCharms: Cell<any[]>;
     selectedCharm: Cell<{ charm: any }>;
   }>(),
   undefined,
   (
-    { charmsList, allCharms, selectedCharm },
+    { charmsList, selectedCharm },
   ) => {
     if (charmsList.length === 0) {
       const isInitialized = Cell.of(false);
@@ -135,7 +131,6 @@ const populateChatList = lift(
         }),
         selectedCharm,
         charmsList,
-        allCharms,
         isInitialized: isInitialized as unknown as Cell<boolean>,
       });
     }
@@ -149,10 +144,9 @@ const createChatRecipe = handler<
   {
     selectedCharm: Cell<{ charm: any }>;
     charmsList: Cell<CharmEntry[]>;
-    allCharms: Cell<MentionableCharm[]>;
   }
 >(
-  (_, { selectedCharm, charmsList, allCharms }) => {
+  (_, { selectedCharm, charmsList }) => {
     const isInitialized = Cell.of(false);
 
     const charm = Chat({
@@ -164,7 +158,6 @@ const createChatRecipe = handler<
       charm,
       selectedCharm,
       charmsList: charmsList as unknown as OpaqueRef<CharmEntry[]>,
-      allCharms,
       isInitialized: isInitialized as unknown as Cell<boolean>,
     });
   },
@@ -237,10 +230,6 @@ const extractLocalMentionable = lift<
 export default recipe<Input, Output>(
   "Launcher",
   ({ selectedCharm, charmsList, theme }) => {
-    const allCharms = derive<MentionableCharm[], MentionableCharm[]>(
-      wish<MentionableCharm[]>("#allCharms"),
-      (c) => c ?? [],
-    );
     logCharmsList({ charmsList: charmsList as unknown as Cell<CharmEntry[]> });
 
     populateChatList({
@@ -248,7 +237,6 @@ export default recipe<Input, Output>(
         Pick<CharmEntry, "charm">
       >,
       charmsList,
-      allCharms,
     });
 
     const selected = getSelectedCharm({ entry: selectedCharm });
@@ -276,7 +264,6 @@ export default recipe<Input, Output>(
                     onClick={createChatRecipe({
                       selectedCharm,
                       charmsList,
-                      allCharms,
                     })}
                   >
                     Create New Chat
@@ -293,7 +280,6 @@ export default recipe<Input, Output>(
                 onct-keybind={createChatRecipe({
                   selectedCharm,
                   charmsList,
-                  allCharms,
                 })}
               />
             </div>
