@@ -463,25 +463,28 @@ export class Scheduler implements IScheduler {
             }
 
             const spaceAndURI = `${space}/${change.address.id}` as SpaceAndURI;
+
+            // IMPORTANT: Always update internedStates for ALL entities, not just those with subscribers.
+            // This ensures that when a subscription is later created for an entity, we have the
+            // correct baseline state. Without this, the first notification after subscribing would
+            // see undefined as oldState, causing spurious triggers.
+            const oldState = this.internedStates.get(spaceAndURI);
+            const newState = change.after !== undefined ? internStringify(change.after) : undefined;
+
+            // Cache the new interned state for next notification
+            if (newState !== undefined) {
+              this.internedStates.set(spaceAndURI, newState);
+            } else {
+              // Entity deleted - remove from cache
+              this.internedStates.delete(spaceAndURI);
+            }
+
             const trie = this.tries.get(spaceAndURI);
 
             if (trie) {
               logger.debug("schedule", () => [
                 `[CHANGE ${changeIndex}] Found trie for ${spaceAndURI}`,
               ]);
-
-              // Use cached interned state as oldState to avoid re-interning
-              // Only intern change.after, then cache it for next notification
-              const oldState = this.internedStates.get(spaceAndURI);
-              const newState = change.after !== undefined ? internStringify(change.after) : undefined;
-
-              // Cache the new interned state for next notification
-              if (newState !== undefined) {
-                this.internedStates.set(spaceAndURI, newState);
-              } else {
-                // Entity deleted - remove from cache
-                this.internedStates.delete(spaceAndURI);
-              }
 
               const onTriggered = (action: Function) => {
                 this.metrics.actionsTriggered++;
