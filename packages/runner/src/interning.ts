@@ -2,7 +2,10 @@ import { refer } from "merkle-reference/json";
 
 const valueCache = new Map<string, any>();
 const stringCache = new Map<string, any>(); // Cache by hashed JSON string to avoid re-parsing
-const MAX_CACHE_SIZE = 50000;
+
+// With bottom-up interning, each node in the tree gets its own cache entry.
+// A document with 1000 nodes uses 1000 entries. Sized for complex apps with many charms.
+const MAX_CACHE_SIZE = 1000000;
 const MAX_STRING_CACHE_SIZE = 10000;
 const INTERN_ID = Symbol("intern-id");
 
@@ -37,8 +40,153 @@ function deepFreeze<T>(obj: T): T {
 }
 
 /**
+ * Compute the shallow key (Merkle node content) for an object or array.
+ *
+ * For each child:
+ * - If it's an object with INTERN_ID, use the ID (already-computed hash)
+ * - Otherwise, stringify the primitive value
+ *
+ * Objects have sorted keys for canonical representation.
+ *
+ * @param value - The object or array to compute a key for
+ * @returns A string representing the shallow structure
+ */
+function computeShallowKey(value: Record<string, unknown> | unknown[]): string {
+  if (Array.isArray(value)) {
+    let shallowKey = '[';
+    for (let i = 0; i < value.length; i++) {
+      if (i > 0) shallowKey += ',';
+      const item = value[i];
+      if (item && typeof item === 'object') {
+        const childId = (item as any)[INTERN_ID];
+        if (childId !== undefined) {
+          shallowKey += childId;
+        } else {
+          // Fallback for non-interned objects
+          shallowKey += JSON.stringify(item);
+        }
+      } else {
+        shallowKey += JSON.stringify(item);
+      }
+    }
+    shallowKey += ']';
+    return shallowKey;
+  } else {
+    // Object: Sort keys for canonical representation
+    const sortedKeys = Object.keys(value).sort();
+    let shallowKey = '{';
+    for (let i = 0; i < sortedKeys.length; i++) {
+      const k = sortedKeys[i];
+      if (i > 0) shallowKey += ',';
+      shallowKey += JSON.stringify(k);
+      shallowKey += ':';
+      const item = value[k];
+      if (item && typeof item === 'object') {
+        const childId = (item as any)[INTERN_ID];
+        if (childId !== undefined) {
+          shallowKey += childId;
+        } else {
+          shallowKey += JSON.stringify(item);
+        }
+      } else {
+        shallowKey += JSON.stringify(item);
+      }
+    }
+    shallowKey += '}';
+    return shallowKey;
+  }
+}
+
+/**
+ * Compute the deterministic ID from a shallow key.
+ * Small keys are used as-is, larger ones are hashed.
+ *
+ * @param shallowKey - The shallow key string
+ * @returns A deterministic ID string
+ */
+function computeId(shallowKey: string): string {
+  // Threshold: 64 chars (roughly length of a CID)
+  if (shallowKey.length < 64) {
+    return shallowKey;
+  }
+  return refer(shallowKey).toString();
+}
+
+/**
+ * Intern a single node, caching and freezing it.
+ * Used internally after shallowKey and id are computed.
+ *
+ * @param value - The object/array to intern
+ * @param id - The computed deterministic ID
+ * @returns The interned (possibly cached) object
+ */
+function internWithId<T extends object>(value: T, id: string): T {
+  // Check cache first
+  const cached = valueCache.get(id);
+  if (cached) {
+    return cached as T;
+  }
+
+  // Cache eviction (LRU-ish)
+  if (valueCache.size >= MAX_CACHE_SIZE) {
+    const firstKey = valueCache.keys().next().value;
+    if (firstKey) {
+      valueCache.delete(firstKey);
+    }
+  }
+
+  // Store metadata
+  Object.defineProperty(value, INTERN_ID, { value: id, enumerable: false, writable: true });
+
+  // Deep freeze for immutability
+  deepFreeze(value);
+
+  // Store in cache
+  valueCache.set(id, value);
+
+  return value;
+}
+
+/**
+ * Intern a single node given its already-interned children.
+ * This enables bottom-up interning during tree traversal.
+ *
+ * The node is constructed with the interned children, then cached based on
+ * its Merkle-style shallow key.
+ *
+ * @param template - The original object/array structure
+ * @param internedChildren - Map of key/index to interned child values
+ * @returns A frozen, interned object with structural sharing
+ */
+export function internNode<T extends object>(
+  template: T,
+  internedChildren: Map<string, unknown>
+): T {
+  // Construct node with interned children
+  let node: any;
+  if (Array.isArray(template)) {
+    node = template.map((original, i) => {
+      const key = String(i);
+      return internedChildren.has(key) ? internedChildren.get(key) : original;
+    });
+  } else {
+    node = { ...template };
+    for (const [key, child] of internedChildren.entries()) {
+      node[key] = child;
+    }
+  }
+
+  // Compute Merkle-style shallow key and ID
+  const shallowKey = computeShallowKey(node);
+  const id = computeId(shallowKey);
+
+  // Intern with the computed ID
+  return internWithId(node, id);
+}
+
+/**
  * JSON.parse reviver that interns objects based on structural (Merkle-like) identity.
- * 
+ *
  * Strategy:
  * 1. Parse bottom-up (standard JSON.parse behavior).
  * 2. For each object/array, construct a "Shallow Key" representing its immediate content.
@@ -49,7 +197,7 @@ function deepFreeze<T>(obj: T): T {
  *    - Small keys are used as-is for readability and zero-collision.
  *    - Large keys are hashed using the standard `merkle-reference` library.
  * 5. We cache based on this ID.
- * 
+ *
  * Benefits:
  * - Deterministic: Identical structures get identical object references.
  * - Memory Efficient: Parent keys only contain short Child IDs, not full subtrees.
@@ -60,91 +208,9 @@ function internReviver(key: string, value: any): any {
     // Optimization: If this specific object instance was already processed, return it.
     if ((value as any)[INTERN_ID]) return value;
 
-    let shallowKey = "";
-    
-    // Construct the Shallow Key (Merkle Node Content)
-    if (Array.isArray(value)) {
-      shallowKey = '[';
-      for (let i = 0; i < value.length; i++) {
-        if (i > 0) shallowKey += ',';
-        const item = value[i];
-        // If child is an object, it must have been processed already (bottom-up).
-        // Use its ID.
-        if (item && typeof item === 'object') {
-           const childId = (item as any)[INTERN_ID];
-           if (childId !== undefined) {
-             shallowKey += childId;
-           } else {
-             // Fallback for safety, though theoretically shouldn't happen in pure JSON.parse flow
-             shallowKey += JSON.stringify(item);
-           }
-        } else {
-           // Primitives
-           shallowKey += JSON.stringify(item);
-        }
-      }
-      shallowKey += ']';
-    } else {
-      // Object: Sort keys for canonical representation
-      const sortedKeys = Object.keys(value).sort();
-      shallowKey = '{';
-      for (let i = 0; i < sortedKeys.length; i++) {
-        const k = sortedKeys[i];
-        if (i > 0) shallowKey += ',';
-        shallowKey += JSON.stringify(k);
-        shallowKey += ':';
-        const item = value[k];
-        
-        if (item && typeof item === 'object') {
-           const childId = (item as any)[INTERN_ID];
-           if (childId !== undefined) {
-             shallowKey += childId;
-           } else {
-             shallowKey += JSON.stringify(item);
-           }
-        } else {
-           shallowKey += JSON.stringify(item);
-        }
-      }
-      shallowKey += '}';
-    }
-
-    // Compute Deterministic ID (Cache Key)
-    let id: string;
-    // Threshold for using raw content as ID. 
-    // 64 chars seems reasonable (roughly length of a CID).
-    if (shallowKey.length < 64) {
-      id = shallowKey;
-    } else {
-      // Use standard Merkle hash for larger nodes
-      id = refer(shallowKey).toString();
-    }
-
-    // Check Cache (Deduplication)
-    const cached = valueCache.get(id);
-    if (cached) {
-      return cached;
-    }
-
-    // Cache Miss: Prepare new entry
-    // 1. Cache Eviction (LRU-ish)
-    if (valueCache.size >= MAX_CACHE_SIZE) {
-      const firstKey = valueCache.keys().next().value;
-      if (firstKey) {
-        valueCache.delete(firstKey);
-      }
-    }
-    
-    // 2. Store Metadata
-    Object.defineProperty(value, INTERN_ID, { value: id, enumerable: false, writable: true });
-
-    // 3. Deep freeze for immutability enforcement
-    deepFreeze(value);
-
-    // 4. Store in Cache
-    valueCache.set(id, value);
-
-    return value;
+    const shallowKey = computeShallowKey(value);
+    const id = computeId(shallowKey);
+    return internWithId(value, id);
   }
 
   return value;

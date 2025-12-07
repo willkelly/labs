@@ -87,7 +87,7 @@ describe("data-updating", () => {
         tx,
       );
       testCell.set({ a: 1, b: { c: 2 } });
-      const changes = normalizeAndDiff(
+      const { changes } = normalizeAndDiff(
         runtime,
         tx,
         testCell.getAsNormalizedFullLink(),
@@ -107,7 +107,7 @@ describe("data-updating", () => {
         tx,
       );
       testCell.set({ a: 1, b: { c: 2 } });
-      const changes = normalizeAndDiff(
+      const { changes } = normalizeAndDiff(
         runtime,
         tx,
         testCell.getAsNormalizedFullLink(),
@@ -205,7 +205,7 @@ describe("data-updating", () => {
       );
       testCell.set({ value: 42 });
       const current = testCell.key("value").getAsNormalizedFullLink();
-      const changes = normalizeAndDiff(runtime, tx, current, 100);
+      const { changes } = normalizeAndDiff(runtime, tx, current, 100);
 
       expect(changes.length).toBe(1);
       expect(changes[0].location).toEqual(current);
@@ -221,7 +221,7 @@ describe("data-updating", () => {
       );
       testCell.set({ user: { name: "John", age: 30 } });
       const current = testCell.key("user").getAsNormalizedFullLink();
-      const changes = normalizeAndDiff(runtime, tx, current, {
+      const { changes } = normalizeAndDiff(runtime, tx, current, {
         name: "Jane",
         age: 30,
       });
@@ -247,7 +247,7 @@ describe("data-updating", () => {
       );
       testCell.set({ user: { name: "John" } });
       const current = testCell.key("user").getAsNormalizedFullLink();
-      const changes = normalizeAndDiff(runtime, tx, current, {
+      const { changes } = normalizeAndDiff(runtime, tx, current, {
         name: "John",
         age: 30,
       });
@@ -271,7 +271,7 @@ describe("data-updating", () => {
       );
       testCell.set({ user: { name: "John", age: 30 } });
       const current = testCell.key("user").getAsNormalizedFullLink();
-      const changes = normalizeAndDiff(runtime, tx, current, { name: "John" });
+      const { changes } = normalizeAndDiff(runtime, tx, current, { name: "John" });
 
       expect(changes.length).toBe(1);
       expect(
@@ -292,7 +292,7 @@ describe("data-updating", () => {
       );
       testCell.set({ items: [1, 2, 3] });
       const current = testCell.key("items").getAsNormalizedFullLink();
-      const changes = normalizeAndDiff(runtime, tx, current, [1, 2]);
+      const { changes } = normalizeAndDiff(runtime, tx, current, [1, 2]);
 
       expect(changes.length).toBe(1);
       expect(
@@ -318,7 +318,7 @@ describe("data-updating", () => {
       // Now set length to 0 through the length property
       const lengthLink = testCell.key("items").key("length")
         .getAsNormalizedFullLink();
-      const changes = normalizeAndDiff(runtime, tx, lengthLink, 0);
+      const { changes } = normalizeAndDiff(runtime, tx, lengthLink, 0);
 
       // Should have 101 changes total
       expect(changes.length).toBe(101);
@@ -351,7 +351,7 @@ describe("data-updating", () => {
       );
       testCell.set({ items: [1, 2, 3] });
       const current = testCell.key("items").getAsNormalizedFullLink();
-      const changes = normalizeAndDiff(runtime, tx, current, [1, 5, 3]);
+      const { changes } = normalizeAndDiff(runtime, tx, current, [1, 5, 3]);
 
       expect(changes.length).toBe(1);
       expect(
@@ -378,7 +378,7 @@ describe("data-updating", () => {
         alias: { $alias: { path: ["value"] } },
       });
       const current = testCell.key("alias").getAsNormalizedFullLink();
-      const changes = normalizeAndDiff(runtime, tx, current, 100);
+      const { changes } = normalizeAndDiff(runtime, tx, current, 100);
 
       // Should follow alias to value and change it there
       expect(changes.length).toBe(1);
@@ -408,7 +408,7 @@ describe("data-updating", () => {
         alias: { $alias: { path: ["value"] } },
       });
       const current = testCell.key("alias").getAsNormalizedFullLink();
-      const changes = normalizeAndDiff(runtime, tx, current, 100);
+      const { changes } = normalizeAndDiff(runtime, tx, current, 100);
 
       // Should follow alias to value and change it there
       expect(changes.length).toBe(1);
@@ -422,7 +422,7 @@ describe("data-updating", () => {
 
       applyChangeSet(tx, changes);
 
-      const changes2 = normalizeAndDiff(runtime, tx, current, {
+      const { changes: changes2 } = normalizeAndDiff(runtime, tx, current, {
         $alias: { path: ["value2"] },
       });
 
@@ -437,7 +437,7 @@ describe("data-updating", () => {
       ).toBe(true);
       expect(changes2[0].value).toEqual({ $alias: { path: ["value2"] } });
 
-      const changes3 = normalizeAndDiff(runtime, tx, current, 300);
+      const { changes: changes3 } = normalizeAndDiff(runtime, tx, current, 300);
 
       expect(changes3.length).toBe(1);
       expect(
@@ -481,7 +481,7 @@ describe("data-updating", () => {
       });
       const current = testCell.key("user").key("profile")
         .getAsNormalizedFullLink();
-      const changes = normalizeAndDiff(runtime, tx, current, {
+      const { changes } = normalizeAndDiff(runtime, tx, current, {
         details: {
           address: {
             city: "Boston",
@@ -513,7 +513,7 @@ describe("data-updating", () => {
       const current = testCell.key("items").key(0).getAsNormalizedFullLink();
 
       const newValue = { [ID]: "item1", name: "First Item" };
-      const changes = normalizeAndDiff(
+      const { changes } = normalizeAndDiff(
         runtime,
         tx,
         current,
@@ -750,7 +750,7 @@ describe("data-updating", () => {
       );
       testCell.set({ value: 42 });
       const current = testCell.key("value").getAsNormalizedFullLink();
-      const changes = normalizeAndDiff(runtime, tx, current, 42);
+      const { changes } = normalizeAndDiff(runtime, tx, current, 42);
 
       expect(changes.length).toBe(0);
     });
@@ -772,7 +772,7 @@ describe("data-updating", () => {
       cellB.set({ value: { name: "Original" } });
 
       const current = cellB.key("value").getAsNormalizedFullLink();
-      const changes = normalizeAndDiff(runtime, tx, current, cellA);
+      const { changes } = normalizeAndDiff(runtime, tx, current, cellA);
 
       expect(changes.length).toBe(1);
       expect(changes[0].location).toEqual(current);
@@ -796,7 +796,7 @@ describe("data-updating", () => {
       cellB.set({ value: { name: "Original" } });
 
       const current = cellB.key("value").getAsNormalizedFullLink();
-      const changes = normalizeAndDiff(runtime, tx, current, cellA);
+      const { changes } = normalizeAndDiff(runtime, tx, current, cellA);
 
       expect(changes.length).toBe(1);
       expect(changes[0].location).toEqual(current);
@@ -804,7 +804,7 @@ describe("data-updating", () => {
 
       applyChangeSet(tx, changes);
 
-      const changes2 = normalizeAndDiff(runtime, tx, current, cellA);
+      const { changes: changes2 } = normalizeAndDiff(runtime, tx, current, cellA);
 
       expect(changes2.length).toBe(0);
     });
@@ -833,7 +833,7 @@ describe("data-updating", () => {
       const current = targetCell.key("value").getAsNormalizedFullLink();
 
       // Write the data cell link to the target
-      const changes = normalizeAndDiff(runtime, tx, current, dataCell);
+      const { changes } = normalizeAndDiff(runtime, tx, current, dataCell);
 
       // Should write the contents of the data cell, not the link itself
       // The data URI handling writes each property individually
@@ -894,7 +894,7 @@ describe("data-updating", () => {
       const nestedDataLink = dataCell.key("nested").key("deep").getAsLink();
 
       // Write the nested data link to the target
-      const changes = normalizeAndDiff(runtime, tx, current, nestedDataLink);
+      const { changes } = normalizeAndDiff(runtime, tx, current, nestedDataLink);
 
       // Should write the contents at the nested path
       // The data URI handling writes each property individually
@@ -951,7 +951,7 @@ describe("data-updating", () => {
       });
 
       // Write the non-existent data link to the target
-      const changes = normalizeAndDiff(runtime, tx, current, nonExistentLink);
+      const { changes } = normalizeAndDiff(runtime, tx, current, nonExistentLink);
 
       // Should write undefined since the path doesn't exist
       expect(changes.length).toBe(1);
@@ -997,7 +997,7 @@ describe("data-updating", () => {
       const current = targetCell.key("result").getAsNormalizedFullLink();
 
       // Write the data cell link to the target
-      const changes = normalizeAndDiff(runtime, tx, current, dataCell);
+      const { changes } = normalizeAndDiff(runtime, tx, current, dataCell);
       // Should write the contents of the data cell, resolving nested links
       expect(changes.length).toBe(5);
 
@@ -1080,7 +1080,7 @@ describe("data-updating", () => {
     const current = targetCell.key("result").getAsNormalizedFullLink();
 
     // Write the data cell link to the target
-    const changes = normalizeAndDiff(
+    const { changes } = normalizeAndDiff(
       runtime,
       tx,
       current,
@@ -1141,7 +1141,7 @@ describe("data-updating", () => {
     // would be written to destinationCell.value instead of target.result
     // After the fix: data URI is inlined first, exposing the redirect, which is
     // then properly written to target.result
-    const changes = normalizeAndDiff(
+    const { changes } = normalizeAndDiff(
       runtime,
       tx,
       current,

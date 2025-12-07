@@ -24,6 +24,7 @@ import {
 } from "./storage/interface.ts";
 import { type IRuntime } from "./runtime.ts";
 import { toURI } from "./uri-utils.ts";
+import { internNode } from "./interning.ts";
 
 const diffLogger = getLogger("normalizeAndDiff", {
   enabled: false,
@@ -53,7 +54,7 @@ export function diffAndUpdate(
   context?: unknown,
   options?: IReadOptions,
 ): boolean {
-  const changes = normalizeAndDiff(
+  const { changes, interned } = normalizeAndDiff(
     runtime,
     tx,
     link,
@@ -74,9 +75,13 @@ type ChangeSet = {
   value: JSONValue | undefined;
 }[];
 
+type NormalizeResult = {
+  changes: ChangeSet;
+  interned: unknown;
+};
+
 /**
- * Traverses objects and returns an array of changes that should be written. An
- * empty array means no changes.
+ * Traverses objects and returns both changes that should be written and the interned value.
  *
  * When encountering an object with a `[ID]` property, it'll be used to compute
  * an entity id based on it's relative location and the passed context, and the
@@ -89,11 +94,14 @@ type ChangeSet = {
  *
  * Any proxy is unwrapped, and docs and cells mapped to doc links.
  *
+ * The interned value is the result of applying structural sharing to newValue,
+ * where cycle detection happens on the ORIGINAL objects before interning.
+ *
  * @param current - A doc link to the current value to compare against.
  * @param newValue - The new value to traverse.
  * @param log - The log to write to.
  * @param context - The context of the change.
- * @returns An array of changes that should be written.
+ * @returns An object with changes to write and the interned value.
  */
 export function normalizeAndDiff(
   runtime: IRuntime,
@@ -103,8 +111,11 @@ export function normalizeAndDiff(
   context?: unknown,
   options?: IReadOptions,
   seen: Map<any, NormalizedFullLink> = new Map(),
-): ChangeSet {
+): NormalizeResult {
   const changes: ChangeSet = [];
+
+  // Store the original newValue for cycle detection and interning
+  const originalNewValue = newValue;
 
   // Log entry with value type and symbol presence
   const valueType = Array.isArray(newValue) ? "array" : typeof newValue;
@@ -164,28 +175,28 @@ export function normalizeAndDiff(
             }, options);
             if (siblingId === id) {
               // We found a sibling with the same id, so ...
-              return [
-                // ... reuse the existing document
-                ...normalizeAndDiff(
-                  runtime,
-                  tx,
-                  link,
-                  v,
-                  context,
-                  options,
-                  seen,
-                ),
-                // ... and update it to the new value
-                ...normalizeAndDiff(
-                  runtime,
-                  tx,
-                  sibling,
-                  rest,
-                  context,
-                  options,
-                  seen,
-                ),
-              ];
+              const result1 = normalizeAndDiff(
+                runtime,
+                tx,
+                link,
+                v,
+                context,
+                options,
+                seen,
+              );
+              const result2 = normalizeAndDiff(
+                runtime,
+                tx,
+                sibling,
+                rest,
+                context,
+                options,
+                seen,
+              );
+              return {
+                changes: [...result1.changes, ...result2.changes],
+                interned: result1.interned, // The link to the sibling document
+              };
             }
           }
         }
@@ -243,7 +254,7 @@ export function normalizeAndDiff(
       () =>
         `[BRANCH_SELF_REF] Self-reference detected, no-op at path=${pathStr}`,
     );
-    return [];
+    return { changes: [], interned: newValue };
   }
 
   // Get current value to compare against
@@ -259,7 +270,7 @@ export function normalizeAndDiff(
         "diff",
         () => `[BRANCH_WRITE_REDIRECT] Same redirect, no-op at path=${pathStr}`,
       );
-      return [];
+      return { changes: [], interned: newValue };
     } else {
       diffLogger.debug(
         "diff",
@@ -267,7 +278,7 @@ export function normalizeAndDiff(
           `[BRANCH_WRITE_REDIRECT] Different redirect, updating at path=${pathStr}`,
       );
       changes.push({ location: link, value: newValue as JSONValue });
-      return changes;
+      return { changes, interned: newValue };
     }
   }
 
@@ -341,17 +352,20 @@ export function normalizeAndDiff(
         "diff",
         () => `[BRANCH_CELL_LINK] Same cell link, no-op at path=${pathStr}`,
       );
-      return [];
+      return { changes: [], interned: newValue };
     } else {
       diffLogger.debug(
         "diff",
         () =>
           `[BRANCH_CELL_LINK] Different cell link, updating at path=${pathStr}`,
       );
-      return [
-        // TODO(seefeld): Normalize the link to a sigil link?
-        { location: link, value: newValue as JSONValue },
-      ];
+      return {
+        changes: [
+          // TODO(seefeld): Normalize the link to a sigil link?
+          { location: link, value: newValue as JSONValue },
+        ],
+        interned: newValue,
+      };
     }
   }
 
@@ -393,28 +407,28 @@ export function normalizeAndDiff(
 
     seen.set(newValue, newEntryLink);
 
-    return [
-      // If it wasn't already, set the current value to be a doc link to this doc
-      ...normalizeAndDiff(
-        runtime,
-        tx,
-        link,
-        createSigilLinkFromParsedLink(newEntryLink, { base: link }),
-        context,
-        options,
-        seen,
-      ),
-      // And see whether the value of the document itself changed
-      ...normalizeAndDiff(
-        runtime,
-        tx,
-        newEntryLink,
-        rest,
-        context,
-        options,
-        seen,
-      ),
-    ];
+    const result1 = normalizeAndDiff(
+      runtime,
+      tx,
+      link,
+      createSigilLinkFromParsedLink(newEntryLink, { base: link }),
+      context,
+      options,
+      seen,
+    );
+    const result2 = normalizeAndDiff(
+      runtime,
+      tx,
+      newEntryLink,
+      rest,
+      context,
+      options,
+      seen,
+    );
+    return {
+      changes: [...result1.changes, ...result2.changes],
+      interned: result1.interned, // The link to the document
+    };
   }
 
   // Handle arrays
@@ -432,13 +446,16 @@ export function normalizeAndDiff(
     // Have to set this before recursing!
     seen.set(newValue, link);
 
+    // Map to collect interned children
+    const internedChildren = new Map<string, unknown>();
+
     for (let i = 0; i < newValue.length; i++) {
       const childSchema = runtime.cfc.getSchemaAtPath(
         link.schema,
         [i.toString()],
         link.rootSchema,
       );
-      const nestedChanges = normalizeAndDiff(
+      const result = normalizeAndDiff(
         runtime,
         tx,
         {
@@ -452,7 +469,8 @@ export function normalizeAndDiff(
         options,
         seen,
       );
-      changes.push(...nestedChanges);
+      changes.push(...result.changes);
+      internedChildren.set(i.toString(), result.interned);
     }
 
     // Handle array length changes
@@ -475,7 +493,16 @@ export function normalizeAndDiff(
       });
     }
 
-    return changes;
+    // Intern the array with its interned children
+    const interned = internNode(originalNewValue as object, internedChildren);
+
+    // O(1) subtree skip: if interned value === currentValue, discard changes
+    // Both are now interned, so === means identical content
+    if (interned === currentValue) {
+      return { changes: [], interned };
+    }
+
+    return { changes, interned };
   }
 
   // Handle objects
@@ -499,6 +526,9 @@ export function normalizeAndDiff(
     // Have to set this before recursing!
     seen.set(newValue, link);
 
+    // Map to collect interned children
+    const internedChildren = new Map<string, unknown>();
+
     for (const key in newValue) {
       diffLogger.debug("diff", () => {
         const childPath = [...link.path, key].join(".");
@@ -510,7 +540,7 @@ export function normalizeAndDiff(
         [key],
         link.rootSchema,
       );
-      const nestedChanges = normalizeAndDiff(
+      const result = normalizeAndDiff(
         runtime,
         tx,
         { ...link, path: [...link.path, key], schema: childSchema },
@@ -519,7 +549,8 @@ export function normalizeAndDiff(
         options,
         seen,
       );
-      changes.push(...nestedChanges);
+      changes.push(...result.changes);
+      internedChildren.set(key, result.interned);
     }
 
     // Handle removed keys
@@ -532,7 +563,16 @@ export function normalizeAndDiff(
       }
     }
 
-    return changes;
+    // Intern the object with its interned children
+    const interned = internNode(originalNewValue as object, internedChildren);
+
+    // O(1) subtree skip: if interned value === currentValue, discard changes
+    // Both are now interned, so === means identical content
+    if (interned === currentValue) {
+      return { changes: [], interned };
+    }
+
+    return { changes, interned };
   }
 
   // When setting array length, also update the removed/added elements.
@@ -561,7 +601,7 @@ export function normalizeAndDiff(
             value: undefined,
           });
         }
-        return changes;
+        return { changes, interned: newValue };
       }
     } // else, i.e. parent is not an array: fall through to the primitive case
   }
@@ -571,7 +611,7 @@ export function normalizeAndDiff(
     changes.push({ location: link, value: newValue as JSONValue });
   }
 
-  return changes;
+  return { changes, interned: newValue };
 }
 
 /**
