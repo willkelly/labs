@@ -2161,13 +2161,14 @@ describe("asCell with schema", () => {
     expect(testCell.get()[0].name).toEqual("First Item");
     expect(testCell.get()[1].name).toEqual("Second Item");
 
-    // Let's make sure we got a different ids with the different context
+    // With content-based IDs, same content produces the same ID regardless of context.
+    // This enables Merkle interning and avoids spurious notifications.
     expect(
       areNormalizedLinksSame(
         parseLink(testCell.getRaw()[0], testCell)!,
         linkFromContext1,
       ),
-    ).toBe(false);
+    ).toBe(true);
 
     expect(testCell.get()).toEqualIgnoringSymbols(initialData);
   });
@@ -2230,9 +2231,9 @@ describe("asCell with schema", () => {
     c.set({ items: [] });
     const arrayCell = c.key("items");
     arrayCell.push({ value: 42 });
-    expect(frame.generatedIdCounter).toEqual(1);
+    // With content-based hashing, generatedIdCounter is no longer used
+    // for objects without [ID] - they get content-based IDs instead
     arrayCell.push({ [ID]: "test", value: 43 });
-    expect(frame.generatedIdCounter).toEqual(1); // No increment = no ID generated from it
     popFrame(frame);
     expect(isAnyCellLink(c.getRaw()?.items[0])).toBe(true);
     expect(isAnyCellLink(c.getRaw()?.items[1])).toBe(true);

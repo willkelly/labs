@@ -27,15 +27,38 @@ const computeIndex = lift<
   ({ allCharms }) => {
     const cs = allCharms ?? [];
 
+    // Build the complete desired backlinks state for each charm FIRST,
+    // then set once. This avoids the clear-then-rebuild pattern that
+    // causes spurious writes and transaction conflicts.
+    const desiredBacklinks = new Map<WriteableBacklinks, WriteableBacklinks[]>();
+
+    // Initialize all charms with empty backlinks
     for (const c of cs) {
-      c.backlinks?.set([]);
+      if (c.backlinks) {
+        desiredBacklinks.set(c, []);
+      }
     }
 
+    // Compute desired backlinks from mentions
     for (const c of cs) {
       const mentions = c.mentioned ?? [];
       for (const m of mentions) {
-        m?.backlinks?.push(c);
+        if (m) {
+          const list = desiredBacklinks.get(m);
+          if (list) {
+            list.push(c);
+          }
+        }
       }
+    }
+
+    // Set final state for each charm.
+    // Sort by JSON representation (which is the Merkle hash for Cell references)
+    // to ensure deterministic order across clients. This enables the idempotency
+    // check in Cell.set() to detect identical content regardless of iteration order.
+    for (const [charm, backlinks] of desiredBacklinks) {
+      backlinks.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+      charm.backlinks?.set(backlinks);
     }
   },
 );

@@ -24,7 +24,7 @@ import {
 } from "./storage/interface.ts";
 import { type IRuntime } from "./runtime.ts";
 import { toURI } from "./uri-utils.ts";
-import { internNode } from "./interning.ts";
+import { internNode, internStringify } from "./interning.ts";
 
 const diffLogger = getLogger("normalizeAndDiff", {
   enabled: false,
@@ -54,6 +54,23 @@ export function diffAndUpdate(
   context?: unknown,
   options?: IReadOptions,
 ): boolean {
+  // Early idempotency check: compare interned representations to avoid
+  // unnecessary work and prevent transaction conflicts when multiple
+  // clients write the same value.
+  try {
+    const currentValue = tx.readValueOrThrow(link, options);
+    if (currentValue !== undefined && newValue !== undefined) {
+      const currentInterned = internStringify(currentValue);
+      const newInterned = internStringify(newValue);
+      if (currentInterned === newInterned) {
+        // Values are identical - no changes needed
+        return false;
+      }
+    }
+  } catch {
+    // If the early check fails, proceed with normal diff
+  }
+
   const { changes, interned } = normalizeAndDiff(
     runtime,
     tx,
@@ -383,12 +400,11 @@ export function normalizeAndDiff(
     // If we're setting an array element, make the array the context for the
     // derived id, not the array index. If it's a nested array, take the parent
     // array as context, recursively.
-    while (
-      path.length > 0 &&
-      Array.isArray(
-        tx.readValueOrThrow({ ...link, path: path.slice(0, -1) }, options),
-      )
-    ) {
+    //
+    // We strip trailing numeric segments from the path to make entity IDs
+    // stable when reordering array elements. This is done purely based on
+    // path structure (not storage reads) for deterministic entity ID generation.
+    while (path.length > 0 && /^\d+$/.test(path[path.length - 1])) {
       path = path.slice(0, -1);
     }
 

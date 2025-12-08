@@ -1,4 +1,5 @@
 import { type Immutable, isObject, isRecord } from "@commontools/utils/types";
+import { refer } from "@commontools/memory/reference";
 import type { MemorySpace } from "@commontools/memory/interface";
 import { getTopFrame, recipe } from "./builder/recipe.ts";
 import { createNodeFactory } from "./builder/module.ts";
@@ -592,6 +593,23 @@ export class CellImpl<T> implements ICell<T>, IStreamable<T> {
 
       // Looks for arrays and makes sure each object gets its own doc.
       const transformedValue = recursivelyAddIDIfNeeded(newValue, this._frame);
+
+      // Idempotency check: skip write if value is unchanged.
+      // This avoids transaction conflicts when multiple clients write the same value.
+      try {
+        const currentValue = this.get();
+        // Only check if we have both values and they can be interned
+        if (currentValue !== undefined && transformedValue !== undefined) {
+          const currentInterned = internStringify(currentValue);
+          const newInterned = internStringify(transformedValue);
+          if (currentInterned === newInterned) {
+            // Value is already what we want - skip the write entirely
+            return this as unknown as Cell<T>;
+          }
+        }
+      } catch {
+        // If interning fails, proceed with the write
+      }
 
       // TODO(@ubik2) investigate whether i need to check classified as i walk down my own obj
       diffAndUpdate(
@@ -1431,10 +1449,21 @@ function recursivelyAddIDIfNeeded<T>(
     result.push(...value.map((v) => {
       const value = recursivelyAddIDIfNeeded(v, frame, seen);
       // For objects on arrays only: Add ID if not already present.
+      // Skip if [ID_FIELD] is set - let diffAndUpdate handle it with its
+      // DOM-like diffing logic that may reuse existing sibling entities.
       if (
-        isObject(value) && !isLink(value) && !(ID in value)
+        isObject(value) && !isLink(value) && !(ID in value) && !(ID_FIELD in value)
       ) {
-        return { [ID]: frame.generatedIdCounter++, ...value };
+        // Use content-based hash for deterministic entity IDs.
+        // This enables Merkle interning: identical content at the same path
+        // produces the same entity ID, avoiding spurious notifications.
+        //
+        // Convert Cells to links before hashing to handle circular references
+        // like { title, items } where items is a Cell referencing the
+        // containing array.
+        const hashableValue = convertCellsToLinks(value);
+        const contentHash = refer(hashableValue).toString();
+        return { [ID]: contentHash, ...value };
       } else {
         return value;
       }

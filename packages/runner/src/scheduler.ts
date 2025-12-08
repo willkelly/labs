@@ -667,6 +667,13 @@ export class Scheduler implements IScheduler {
     }
 
     if (this.pending.size === 0 && this.eventQueue.length === 0) {
+      // Debug: dump metrics when going idle
+      const trieMetrics = this.getTrieMetrics();
+      if (this.metrics.actionsTriggered > 0) {
+        console.log(`[scheduler-idle] notifications=${this.metrics.storageNotifications} changes=${this.metrics.changesReceived} triggered=${this.metrics.actionsTriggered} skipped=${this.metrics.changesSkippedNoSubscribers} subtreesSkipped=${trieMetrics.subtreesSkipped}`);
+        this.resetMetrics();
+      }
+
       const promises = this.idlePromises;
       for (const resolve of promises) resolve();
       this.idlePromises.length = 0;
