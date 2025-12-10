@@ -13,6 +13,7 @@ import { StorageManager } from "@commontools/runner/storage/cache.deno";
 
 import {
   createSession,
+  deserializeKeyPairRaw,
   type DID,
   Identity,
   Session,
@@ -88,7 +89,9 @@ async function initialize(
   }
 
   const { did, toolshedUrl, rawIdentity } = data;
-  const identity = await Identity.deserialize(rawIdentity);
+  // Convert number arrays back to Uint8Arrays for Identity.deserialize
+  const keyPairRaw = deserializeKeyPairRaw(rawIdentity);
+  const identity = await Identity.deserialize(keyPairRaw);
   const apiUrl = new URL(toolshedUrl);
 
   // Initialize session

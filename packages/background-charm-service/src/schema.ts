@@ -5,6 +5,10 @@ export const BG_SYSTEM_SPACE_ID =
   "did:key:z6Mkfuw7h6jDwqVb6wimYGys14JFcyTem4Kqvdj9DjpFhY88";
 // This maps to of:baedreiew6ioyvfnvp2bdvmgkkz64ffk6gssvgmibh7yaw43yqhtv2nq75a
 export const BG_CELL_CAUSE = "bgUpdater-2025-03-18";
+// Cell cause for local (per-space) registry mode used in clusterduck
+export const LOCAL_BG_CELL_CAUSE = "bg-charms";
+// Registry mode: "central" uses system space, "local" uses charm's own space
+export type RegistryMode = "central" | "local";
 export const BGCharmEntrySchema = {
   type: "object",
   properties: {

@@ -7,5 +7,7 @@ export {
   BG_SYSTEM_SPACE_ID,
   type BGCharmEntry,
   BGCharmEntrySchema,
+  LOCAL_BG_CELL_CAUSE,
+  type RegistryMode,
 } from "./schema.ts";
 export { setBGCharm } from "./utils.ts";

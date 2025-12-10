@@ -118,6 +118,18 @@ export function isInsecureCryptoKeyPair(
   );
 }
 
+export function isTransferrableInsecureCryptoKeyPair(
+  input: unknown,
+): input is TransferrableInsecureCryptoKeyPair {
+  return !!(
+    isRecord(input) &&
+    Array.isArray(input.privateKey) &&
+    Array.isArray(input.publicKey) &&
+    input.privateKey.every((n: unknown) => typeof n === "number") &&
+    input.publicKey.every((n: unknown) => typeof n === "number")
+  );
+}
+
 export function isKeyPairRaw(value: unknown): value is KeyPairRaw {
   return isCryptoKeyPair(value) || isInsecureCryptoKeyPair(value);
 }

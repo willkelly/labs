@@ -1,4 +1,7 @@
-import { isKeyPairRaw, KeyPairRaw } from "@commontools/identity";
+import {
+  isTransferrableInsecureCryptoKeyPair,
+  type TransferrableInsecureCryptoKeyPair,
+} from "@commontools/identity";
 import { isRecord } from "@commontools/utils/types";
 
 export enum WorkerIPCMessageType {
@@ -10,7 +13,7 @@ export enum WorkerIPCMessageType {
 export type InitializationData = {
   did: string;
   toolshedUrl: string;
-  rawIdentity: KeyPairRaw;
+  rawIdentity: TransferrableInsecureCryptoKeyPair;
 };
 
 export function isInitializationData(
@@ -19,7 +22,7 @@ export function isInitializationData(
   return !!(isRecord(value) &&
     typeof value.did === "string" &&
     typeof value.toolshedUrl === "string" &&
-    isKeyPairRaw(value.rawIdentity));
+    isTransferrableInsecureCryptoKeyPair(value.rawIdentity));
 }
 
 export type RunData = {

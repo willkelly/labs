@@ -192,6 +192,7 @@ async function buildToolshed(config: BuildConfig): Promise<void> {
       // prior to building.
       "--no-check",
       "--unstable-otel",
+      "--unstable-worker-options", // Required for background charm service workers
       "--output",
       config.distPath("toolshed"),
       "--include",
@@ -204,6 +205,8 @@ async function buildToolshed(config: BuildConfig): Promise<void> {
       config.staticAssetsPath(),
       "--include",
       config.patternsPath(),
+      "--include",
+      config.bgCharmServiceWorkerPath(), // Include worker.ts for background charm service
       ...config.toolshedFlags,
       config.toolshedEntryPath(),
     ],

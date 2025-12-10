@@ -6,6 +6,8 @@ import {
   BG_SYSTEM_SPACE_ID,
   type BGCharmEntry,
   BGCharmEntrySchema,
+  LOCAL_BG_CELL_CAUSE,
+  type RegistryMode,
 } from "./schema.ts";
 
 export function isValidDID(did: string): boolean {
@@ -59,6 +61,7 @@ export async function setBGCharm({
   runtime,
   bgSpace,
   bgCause,
+  mode = "central",
 }: {
   space: string;
   charmId: string;
@@ -66,11 +69,22 @@ export async function setBGCharm({
   runtime: Runtime;
   bgSpace?: MemorySpace;
   bgCause?: string;
+  mode?: RegistryMode;
 }): Promise<boolean> {
+  // In local mode, use the charm's own space as the registry
+  const registrySpace = mode === "local"
+    ? (space as MemorySpace)
+    : (bgSpace ?? BG_SYSTEM_SPACE_ID);
+  const registryCause = mode === "local"
+    ? LOCAL_BG_CELL_CAUSE
+    : (bgCause ?? BG_CELL_CAUSE);
+
   const charmsCell = await getBGCharms({
-    bgSpace,
-    bgCause,
+    bgSpace: registrySpace,
+    bgCause: registryCause,
     runtime,
+    mode,
+    spaceId: mode === "local" ? (space as MemorySpace) : undefined,
   });
 
   console.log(
@@ -122,16 +136,29 @@ export async function setBGCharm({
 }
 
 export async function getBGCharms(
-  { bgSpace, bgCause, runtime }: {
+  { bgSpace, bgCause, runtime, mode = "central", spaceId }: {
     bgSpace?: MemorySpace;
     bgCause?: string;
     runtime: Runtime;
+    mode?: RegistryMode;
+    spaceId?: MemorySpace;
   },
 ): Promise<
   Cell<Cell<BGCharmEntry>[]>
 > {
-  bgSpace = bgSpace ?? BG_SYSTEM_SPACE_ID;
-  bgCause = bgCause ?? BG_CELL_CAUSE;
+  // Validate local mode requirements
+  if (mode === "local" && !spaceId && !bgSpace) {
+    throw new Error("spaceId is required when using local registry mode");
+  }
+
+  // Use mode-specific defaults
+  if (mode === "local") {
+    bgSpace = bgSpace ?? spaceId!;
+    bgCause = bgCause ?? LOCAL_BG_CELL_CAUSE;
+  } else {
+    bgSpace = bgSpace ?? BG_SYSTEM_SPACE_ID;
+    bgCause = bgCause ?? BG_CELL_CAUSE;
+  }
 
   const schema = {
     type: "array",

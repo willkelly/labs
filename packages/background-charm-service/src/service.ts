@@ -4,6 +4,8 @@ import {
   BG_CELL_CAUSE,
   BG_SYSTEM_SPACE_ID,
   type BGCharmEntry,
+  LOCAL_BG_CELL_CAUSE,
+  type RegistryMode,
 } from "./schema.ts";
 import { getBGCharms } from "./utils.ts";
 import { SpaceManager } from "./space-manager.ts";
@@ -16,6 +18,8 @@ export interface BackgroundCharmServiceOptions {
   bgSpace?: MemorySpace;
   bgCause?: string;
   workerTimeoutMs?: number;
+  registryMode?: RegistryMode;
+  targetSpaceDid?: MemorySpace; // Required when registryMode="local"
 }
 
 export class BackgroundCharmService {
@@ -28,22 +32,39 @@ export class BackgroundCharmService {
   private bgSpace: MemorySpace;
   private bgCause: string;
   private workerTimeoutMs?: number;
+  private registryMode: RegistryMode;
+  private targetSpaceDid?: MemorySpace;
 
   constructor(options: BackgroundCharmServiceOptions) {
     this.identity = options.identity;
     this.toolshedUrl = options.toolshedUrl;
     this.runtime = options.runtime;
+    this.registryMode = options.registryMode ?? "central";
+    this.targetSpaceDid = options.targetSpaceDid;
     this.bgSpace = options.bgSpace ?? BG_SYSTEM_SPACE_ID;
-    this.bgCause = options.bgCause ?? BG_CELL_CAUSE;
+    this.bgCause = options.bgCause ??
+      (this.registryMode === "local" ? LOCAL_BG_CELL_CAUSE : BG_CELL_CAUSE);
     this.workerTimeoutMs = options.workerTimeoutMs;
   }
 
   async initialize() {
+    // Validate local mode requirements
+    if (this.registryMode === "local" && !this.targetSpaceDid) {
+      throw new Error("targetSpaceDid is required when registryMode is 'local'");
+    }
+
+    console.log(
+      `Initializing BackgroundCharmService in ${this.registryMode} mode` +
+        (this.registryMode === "local" ? ` for space ${this.targetSpaceDid}` : ""),
+    );
+
     // Storage URL and signer are already configured in the Runtime
     this.charmsCell = await getBGCharms({
-      bgSpace: this.bgSpace,
+      bgSpace: this.registryMode === "local" ? this.targetSpaceDid : this.bgSpace,
       bgCause: this.bgCause,
       runtime: this.runtime,
+      mode: this.registryMode,
+      spaceId: this.registryMode === "local" ? this.targetSpaceDid : undefined,
     });
     await this.charmsCell.sync();
     await this.runtime.storageManager.synced();
@@ -79,15 +100,34 @@ export class BackgroundCharmService {
       return;
     }
 
+    const [cancel, addCancel] = useCancelGroup();
+
+    // In local mode, all charms are for our single target space
+    if (this.registryMode === "local") {
+      if (!this.charmSchedulers.has(this.targetSpaceDid!)) {
+        const scheduler = new SpaceManager({
+          did: this.targetSpaceDid!,
+          toolshedUrl: this.toolshedUrl,
+          identity: this.identity,
+          timeoutMs: this.workerTimeoutMs,
+        });
+        this.charmSchedulers.set(this.targetSpaceDid!, scheduler);
+        scheduler.start();
+      }
+      const scheduler = this.charmSchedulers.get(this.targetSpaceDid!)!;
+      addCancel(scheduler.watch([...charms]));
+      console.log(`[local mode] monitoring ${charms.length} charms for space ${this.targetSpaceDid}`);
+      return cancel;
+    }
+
+    // Central mode - original multi-space logic
     // Charms that hit an e.g. Authorization Error are empty, and space
     // is undefined -- filter out any of these charms before creating
     // a worker
     const charmContents = charms.map((c) => c.get()).filter(Boolean);
     const enabledCharms = charmContents.filter((c) => !c.disabledAt);
     const dids = new Set(enabledCharms.map((c) => c.space));
-    console.log(`monitoring ${dids.size} spaces`);
-
-    const [cancel, addCancel] = useCancelGroup();
+    console.log(`[central mode] monitoring ${dids.size} spaces`);
 
     for (const did of dids) {
       let scheduler = this.charmSchedulers.get(did);

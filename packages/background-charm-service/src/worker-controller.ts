@@ -1,6 +1,6 @@
 import { BGCharmEntry } from "./schema.ts";
 import { Cell } from "@commontools/runner";
-import { Identity } from "@commontools/identity";
+import { Identity, serializeKeyPairRaw } from "@commontools/identity";
 import { defer, type Deferred } from "@commontools/utils/defer";
 import {
   isWorkerIPCRequest,
@@ -86,10 +86,14 @@ export class WorkerController extends EventTarget {
     }
     this.state = WorkerState.Initializing;
     try {
+      const rawIdentity = serializeKeyPairRaw(this.identity.serialize());
+      if (!rawIdentity) {
+        throw new Error("Cannot serialize identity for worker transfer");
+      }
       await this.exec(WorkerIPCMessageType.Initialize, {
         did: this.did,
         toolshedUrl: this.toolshedUrl,
-        rawIdentity: this.identity.serialize(),
+        rawIdentity,
       });
       this.state = WorkerState.Ready;
     } catch (e) {

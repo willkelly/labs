@@ -1,12 +1,14 @@
 import app from "@/app.ts";
 import env from "@/env.ts";
 import { identity } from "@/lib/identity.ts";
-import { Runtime } from "@commontools/runner";
+import { Runtime, type MemorySpace } from "@commontools/runner";
 import { StorageManager } from "@commontools/runner/storage/cache.deno";
 import { memory } from "@/routes/storage/memory.ts";
+import { BackgroundCharmService } from "@commontools/background-charm";
 
 // Create a global runtime instance for the server
 let runtime: Runtime;
+let bgService: BackgroundCharmService | null = null;
 
 // Initialize runtime with storage and signer
 // FIXME(ja): should we do this even on memory-only toolsheds?
@@ -30,6 +32,26 @@ const initializeRuntime = () => {
 
 // Export runtime for use in other parts of the application
 export { runtime };
+
+// Initialize background charm service (must be called AFTER server is listening)
+const initializeBackgroundCharmService = async () => {
+  if (env.BG_REGISTRY_MODE === "local") {
+    if (!env.SPACE_DID) {
+      console.warn("BG_REGISTRY_MODE=local but SPACE_DID not set, skipping bgService");
+      return;
+    }
+    console.log(`Initializing background charm service in local mode for space ${env.SPACE_DID}...`);
+    bgService = new BackgroundCharmService({
+      identity,
+      toolshedUrl: env.API_URL,
+      runtime,
+      registryMode: "local",
+      targetSpaceDid: env.SPACE_DID as MemorySpace,
+    });
+    await bgService.initialize();
+    console.log("Background charm service initialized");
+  }
+};
 
 export type AppType = typeof app;
 
@@ -62,6 +84,13 @@ const handleShutdown = async () => {
 
         ac.abort();
 
+        // Stop background charm service if running
+        if (bgService) {
+          console.log("Stopping background charm service...");
+          await bgService.stop();
+          console.log("Background charm service stopped");
+        }
+
         console.log("Closing memory system...");
         const result = await memory.close();
         if (result.error) {
@@ -93,8 +122,15 @@ function startServer() {
       console.error("Server error:", error);
       return new Response("Internal Server Error", { status: 500 });
     },
-    onListen: ({ port, hostname }: { port: number; hostname: string }) => {
+    onListen: async ({ port, hostname }: { port: number; hostname: string }) => {
       console.log(`Server running on http://${hostname}:${port}`);
+
+      // Initialize background charm service after server is listening
+      try {
+        await initializeBackgroundCharmService();
+      } catch (error) {
+        console.error("Failed to initialize background charm service:", error);
+      }
     },
   };
 

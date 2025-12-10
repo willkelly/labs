@@ -118,6 +118,12 @@ const EnvSchema = z.object({
 
   // In development, you can optionally proxy the upstream SHELL
   SHELL_URL: z.string().optional(),
+
+  // Background Charm Service
+  // "central" (default): system-wide registry, "local": per-space registry
+  BG_REGISTRY_MODE: z.enum(["central", "local"]).default("central"),
+  // Required when BG_REGISTRY_MODE=local - the space DID to monitor
+  SPACE_DID: z.string().optional(),
 });
 
 export type env = z.infer<typeof EnvSchema>;
