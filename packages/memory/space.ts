@@ -145,6 +145,7 @@ const PRAGMAS = `
   PRAGMA temp_store=MEMORY;
   PRAGMA mmap_size=268435456;
   PRAGMA foreign_keys=ON;
+  PRAGMA wal_autocheckpoint=0;
 `;
 
 // Must be set before database has any content (new DBs only)
@@ -1298,4 +1299,65 @@ export function toSelection(
     );
   }
   return result;
+}
+
+// =============================================================================
+// Worker Read Pool Exports
+// These exports are used by the read worker to execute queries with its own
+// database connections. The worker uses a pool of read-only connections.
+// =============================================================================
+
+/**
+ * SQL query for exporting facts from the state view.
+ * Used by the read worker pool for query operations.
+ */
+export const EXPORT_SQL = EXPORT;
+
+/**
+ * Execute a query directly on a database connection.
+ * Used by read workers with their pooled connections.
+ *
+ * @param db - The SQLite database connection
+ * @param subject - The space subject identifier
+ * @param args - Query arguments (select, since)
+ * @returns The FactSelection result
+ */
+export function executeQuery<Space extends MemorySpace>(
+  db: Database,
+  subject: Space,
+  args: Query<Space>["args"],
+): FactSelection {
+  // Create a minimal session for the select function
+  const session: Session<Space> = {
+    subject,
+    store: db,
+  };
+
+  // Run the select logic (same as query() but without transaction wrapper)
+  return select(session, args);
+}
+
+/**
+ * Execute a schema query directly on a database connection.
+ * Used by read workers with their pooled connections.
+ *
+ * @param db - The SQLite database connection
+ * @param subject - The space subject identifier
+ * @param args - Schema query arguments
+ * @returns The FactSelection result
+ */
+export function executeSchemaQuery<Space extends MemorySpace>(
+  db: Database,
+  subject: Space,
+  args: SchemaQuery<Space>["args"],
+): FactSelection {
+  // Create a minimal session for the selectSchema function
+  const session: Session<Space> = {
+    subject,
+    store: db,
+  };
+
+  // Run the selectSchema logic (same as querySchema() but without transaction wrapper)
+  const { facts } = selectSchema(session, args);
+  return facts;
 }

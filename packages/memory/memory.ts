@@ -1,7 +1,7 @@
 import * as FS from "@std/fs";
 import * as Path from "@std/path";
 
-import * as Error from "./error.ts";
+import * as MemoryError from "./error.ts";
 import * as Space from "./space.ts";
 import {
   addChangesAttributes,
@@ -18,6 +18,7 @@ import {
   QueryResult,
   Result,
   SchemaQuery,
+  Selection,
   SpaceSession,
   Subscriber,
   SubscribeResult,
@@ -27,6 +28,15 @@ import {
 } from "./interface.ts";
 export * from "./interface.ts";
 import { type DID } from "@commontools/identity";
+import { defer, type Deferred } from "@commontools/utils/defer";
+import {
+  createErrorResponse,
+  isReadyMessage,
+  isWorkerResponse,
+  MessageType,
+  type WorkerResponse,
+} from "./worker/protocol.ts";
+import { deserializeSelection } from "./worker/serializer.ts";
 
 interface Session {
   store: URL;
@@ -34,10 +44,241 @@ interface Session {
   spaces: Map<string, SpaceSession>;
 }
 
+// =============================================================================
+// Read Worker Controller
+// Manages a worker that executes read queries using a connection pool.
+// =============================================================================
+
+const DEFAULT_WORKER_TIMEOUT = 30_000; // 30 seconds
+const DEFAULT_POOL_SIZE = 10;
+
+enum WorkerState {
+  Uninitialized = "uninitialized",
+  Initializing = "initializing",
+  Ready = "ready",
+  Terminating = "terminating",
+  Terminated = "terminated",
+  Error = "error",
+}
+
+interface PendingRequest {
+  deferred: Deferred<Selection>;
+  timeout: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * Controller for a read worker that handles concurrent read queries.
+ * Each space gets its own worker with a pool of read-only connections.
+ */
+class ReadWorkerController {
+  private worker: Worker;
+  private state = WorkerState.Uninitialized;
+  private msgId = 0;
+  private pending = new Map<number, PendingRequest>();
+  private initDeferred = defer<void>();
+  private timeoutMs: number;
+
+  constructor(
+    private spaceUrl: URL,
+    private subject: string,
+    private poolSize: number = DEFAULT_POOL_SIZE,
+    timeoutMs?: number,
+  ) {
+    this.timeoutMs = timeoutMs ?? DEFAULT_WORKER_TIMEOUT;
+
+    this.worker = new Worker(
+      new URL("./worker/read-worker.ts", import.meta.url).href,
+      {
+        type: "module",
+        name: `read-worker-${subject}`,
+      },
+    );
+
+    this.worker.addEventListener("message", this.onMessage);
+    this.worker.addEventListener("error", this.onError);
+  }
+
+  /**
+   * Initialize the worker and its connection pool.
+   */
+  async initialize(): Promise<void> {
+    if (this.state !== WorkerState.Uninitialized) {
+      throw new Error(`Cannot initialize worker in state: ${this.state}`);
+    }
+    this.state = WorkerState.Initializing;
+
+    try {
+      await this.initDeferred.promise;
+
+      // Send init message
+      await this.exec(MessageType.Init, {
+        spaceUrl: this.spaceUrl.toString(),
+        subject: this.subject,
+        poolSize: this.poolSize,
+      });
+
+      this.state = WorkerState.Ready;
+    } catch (error) {
+      this.state = WorkerState.Error;
+      throw error;
+    }
+  }
+
+  /**
+   * Execute a query on the worker.
+   */
+  async query(source: Query): Promise<Result<Selection, Error>> {
+    if (this.state !== WorkerState.Ready) {
+      throw new Error(`Worker not ready: ${this.state}`);
+    }
+
+    try {
+      const result = await this.exec(MessageType.Query, {
+        args: source.args,
+      });
+      return { ok: result as Selection };
+    } catch (error) {
+      return { error: error as Error };
+    }
+  }
+
+  /**
+   * Execute a schema query on the worker.
+   */
+  async querySchema(source: SchemaQuery): Promise<Result<Selection, Error>> {
+    if (this.state !== WorkerState.Ready) {
+      throw new Error(`Worker not ready: ${this.state}`);
+    }
+
+    try {
+      const result = await this.exec(MessageType.QuerySchema, {
+        args: source.args,
+      });
+      return { ok: result as Selection };
+    } catch (error) {
+      return { error: error as Error };
+    }
+  }
+
+  /**
+   * Close the worker and cleanup resources.
+   */
+  async close(): Promise<void> {
+    if (
+      this.state === WorkerState.Terminating ||
+      this.state === WorkerState.Terminated
+    ) {
+      return;
+    }
+
+    this.state = WorkerState.Terminating;
+
+    // Reject all pending requests
+    for (const [, pending] of this.pending) {
+      clearTimeout(pending.timeout);
+      pending.deferred.reject(new Error("Worker shutting down"));
+    }
+    this.pending.clear();
+
+    try {
+      await this.exec(MessageType.Close, {});
+    } catch {
+      // Ignore close errors
+    }
+
+    this.worker.terminate();
+    this.state = WorkerState.Terminated;
+  }
+
+  /**
+   * Check if the worker is ready.
+   */
+  isReady(): boolean {
+    return this.state === WorkerState.Ready;
+  }
+
+  private exec(type: MessageType, data: Record<string, unknown>): Promise<unknown> {
+    const msgId = this.msgId++;
+    const deferred = defer<Selection>();
+
+    const timeout = setTimeout(() => {
+      this.pending.delete(msgId);
+      deferred.reject(new Error(`Worker request timed out after ${this.timeoutMs}ms`));
+    }, this.timeoutMs);
+
+    this.pending.set(msgId, { deferred, timeout });
+
+    this.worker.postMessage({ type, msgId, ...data });
+
+    return deferred.promise;
+  }
+
+  private onMessage = (event: MessageEvent) => {
+    const data = event.data;
+
+    // Handle ready message
+    if (isReadyMessage(data)) {
+      this.initDeferred.resolve();
+      return;
+    }
+
+    // Handle response
+    if (!isWorkerResponse(data)) {
+      console.error("Read worker: Invalid response:", data);
+      return;
+    }
+
+    const pending = this.pending.get(data.msgId);
+    if (!pending) {
+      console.error("Read worker: No pending request for msgId:", data.msgId);
+      return;
+    }
+
+    this.pending.delete(data.msgId);
+    clearTimeout(pending.timeout);
+
+    if (data.ok) {
+      // Deserialize result if needed
+      if ("resultBuffer" in data && data.resultBuffer) {
+        const selection = deserializeSelection(data.resultBuffer);
+        pending.deferred.resolve(selection);
+      } else {
+        pending.deferred.resolve(data.result as Selection);
+      }
+    } else {
+      const error = new Error(data.error.message);
+      error.name = data.error.name;
+      pending.deferred.reject(error);
+    }
+  };
+
+  private onError = (event: ErrorEvent) => {
+    console.error("Read worker error:", event);
+    event.preventDefault();
+
+    this.state = WorkerState.Error;
+
+    // Reject all pending requests
+    for (const [, pending] of this.pending) {
+      clearTimeout(pending.timeout);
+      pending.deferred.reject(new Error("Worker error: " + event.message));
+    }
+    this.pending.clear();
+
+    this.worker.terminate();
+  };
+}
+
+// =============================================================================
+// Memory Class
+// =============================================================================
+
 export class Memory implements Session, MemorySession {
   store: URL;
   ready: Promise<unknown>;
   #serviceDid: DID;
+  #readWorkers: Map<Subject, ReadWorkerController> = new Map();
+  #workerInitPromises: Map<Subject, Promise<ReadWorkerController>> = new Map();
 
   constructor(
     options: Options,
@@ -65,8 +306,8 @@ export class Memory implements Session, MemorySession {
   }
 
   /**
-   * Runs task one at a time, this works around some bug in deno sqlite bindings
-   * which seems to cause problems if query and transaction happen concurrently.
+   * Runs task one at a time. Used for write operations (transact).
+   * Read operations now use the worker pool for concurrency.
    */
   async perform<Out>(task: () => Promise<Out>): Promise<Out> {
     return await traceAsync("memory.perform", async (_span) => {
@@ -77,6 +318,56 @@ export class Memory implements Session, MemorySession {
     });
   }
 
+  /**
+   * Check if this is an in-memory database (workers can't share memory DBs).
+   */
+  private isInMemory(): boolean {
+    return this.store.protocol === "memory:";
+  }
+
+  /**
+   * Get or create a read worker for the given space.
+   * Workers are lazily initialized on first read to each space.
+   * Returns null for in-memory databases (workers can't share them).
+   */
+  private async getReadWorker(subject: Subject): Promise<ReadWorkerController | null> {
+    // In-memory databases can't be shared across workers
+    if (this.isInMemory()) {
+      return null;
+    }
+
+    // Return existing ready worker
+    const existing = this.#readWorkers.get(subject);
+    if (existing?.isReady()) {
+      return existing;
+    }
+
+    // Check if initialization is in progress
+    const initPromise = this.#workerInitPromises.get(subject);
+    if (initPromise) {
+      return initPromise;
+    }
+
+    // Create and initialize new worker
+    const isFile = Path.extname(this.store.pathname) !== "";
+    const spaceUrl = isFile
+      ? this.store
+      : new URL(`./${subject}.sqlite`, this.store);
+
+    const worker = new ReadWorkerController(spaceUrl, subject);
+
+    // Store the initialization promise to prevent duplicate workers
+    const promise = (async () => {
+      await worker.initialize();
+      this.#readWorkers.set(subject, worker);
+      this.#workerInitPromises.delete(subject);
+      return worker;
+    })();
+
+    this.#workerInitPromises.set(subject, promise);
+    return promise;
+  }
+
   subscribe(subscriber: Subscriber): SubscribeResult {
     return subscribe(this, subscriber);
   }
@@ -85,19 +376,99 @@ export class Memory implements Session, MemorySession {
     return unsubscribe(this, subscriber);
   }
 
+  /**
+   * Execute a write transaction. Writes are serialized through perform().
+   */
   transact(transaction: Transaction): TransactionResult {
     return this.perform(() => transact(this, transaction));
   }
 
+  /**
+   * Execute a read query. Reads are concurrent via the worker pool.
+   * Falls back to main thread for in-memory databases.
+   */
   query(source: Query): QueryResult {
-    return this.perform(() => query(this, source));
+    return traceAsync("memory.query", async (span) => {
+      addMemoryAttributes(span, {
+        operation: "query",
+        space: source.sub,
+      });
+
+      // Try to use worker for concurrent reads
+      const worker = await this.getReadWorker(source.sub);
+      if (worker) {
+        span.setAttribute("query.mode", "worker");
+        try {
+          const result = await worker.query(source);
+          if (result.error) {
+            span.setAttribute("query.status", "error");
+            return { error: MemoryError.query(source.sub, source.args.select, result.error as SystemError) };
+          }
+          span.setAttribute("query.status", "success");
+          return { ok: result.ok };
+        } catch (error) {
+          span.setAttribute("query.status", "error");
+          span.setAttribute("query.error", String(error));
+          return { error: MemoryError.query(source.sub, source.args.select, error as SystemError) };
+        }
+      }
+
+      // Fall back to main thread for in-memory databases
+      span.setAttribute("query.mode", "main-thread");
+      return await this.perform(() => query(this, source));
+    });
   }
 
+  /**
+   * Execute a schema query. Reads are concurrent via the worker pool.
+   * Falls back to main thread for in-memory databases.
+   */
   querySchema(source: SchemaQuery): QueryResult {
-    return this.perform(() => querySchema(this, source));
+    return traceAsync("memory.querySchema", async (span) => {
+      addMemoryAttributes(span, {
+        operation: "querySchema",
+        space: source.sub,
+      });
+
+      // Try to use worker for concurrent reads
+      const worker = await this.getReadWorker(source.sub);
+      if (worker) {
+        span.setAttribute("querySchema.mode", "worker");
+        try {
+          const result = await worker.querySchema(source);
+          if (result.error) {
+            span.setAttribute("querySchema.status", "error");
+            return { error: MemoryError.query(source.sub, source.args.selectSchema, result.error as SystemError) };
+          }
+          span.setAttribute("querySchema.status", "success");
+          return { ok: result.ok };
+        } catch (error) {
+          span.setAttribute("querySchema.status", "error");
+          span.setAttribute("querySchema.error", String(error));
+          return { error: MemoryError.query(source.sub, source.args.selectSchema, error as SystemError) };
+        }
+      }
+
+      // Fall back to main thread for in-memory databases
+      span.setAttribute("querySchema.mode", "main-thread");
+      return await this.perform(() => querySchema(this, source));
+    });
   }
 
-  close() {
+  /**
+   * Close the memory session and all workers.
+   */
+  async close() {
+    // Close all read workers first (not in perform() to allow cleanup)
+    const workerClosePromises: Promise<void>[] = [];
+    for (const worker of this.#readWorkers.values()) {
+      workerClosePromises.push(worker.close());
+    }
+    await Promise.all(workerClosePromises);
+    this.#readWorkers.clear();
+    this.#workerInitPromises.clear();
+
+    // Then close the main session (serialized)
     return this.perform(() => close(this));
   }
 }
@@ -321,7 +692,7 @@ export const open = async (
       }
       return { ok: await new Memory(options) };
     } catch (cause) {
-      return { error: Error.connection(options.store, cause as SystemError) };
+      return { error: MemoryError.connection(options.store, cause as SystemError) };
     }
   });
 };
